@@ -1,0 +1,24 @@
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -1895,7 +1895,21 @@
+ 	if (result.message == null) return "Task completed";
+ 	return filterSubagentResult([result.message]);
+ }
++/** BOS-Patch: Schreibt ein Subagent seine Antwort und schliesst nach einem weiteren Werkzeugaufruf
++*  mit einem kurzen Satz ("siehe oben"), ginge die Antwort verloren. Ist der letzte Text kuerzer als
++*  1000 Zeichen, steht der laengste fruehere Text des Subagenten davor. */
+ function filterSubagentResult(messages) {
++	const last = filterLastSubagentText(messages);
++	if (last === "Task completed" || last.length >= 1000) return last;
++	let longest = "";
++	for (const message of messages) {
++		if (message._getType() !== "ai") continue;
++		const text = filterLastSubagentText([message]);
++		if (text !== "Task completed" && text.length > longest.length) longest = text;
++	}
++	return longest.length > last.length ? `${longest}\n\n${last}` : last;
++}
++function filterLastSubagentText(messages) {
+ 	for (let i = messages.length - 1; i >= 0; i--) {
+ 		if (messages[i]._getType() !== "ai") continue;
+ 		const content = messages[i].content;

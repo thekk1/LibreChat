@@ -1,0 +1,43 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -47244,6 +47244,40 @@
+ 	askTool.invoke = (async (input, config) => {
+ 		try {
+ 			const candidate = typeof input === "object" && input != null && "args" in input ? input.args : input;
++			/** BOS-Patch: Qwen ueber radiance liefert verschachtelte Listen als JSON-Text
++			*  ("questions": "[{...}]"); vor der Schemapruefung in Listen umwandeln. */
++			const parseJsonList = (value) => {
++				if (typeof value !== "string") return value;
++				try {
++					const parsed = JSON.parse(value);
++					return Array.isArray(parsed) ? parsed : value;
++				} catch {
++					/** Deutsches Anfuehrungszeichen „…" mit geradem Schlusszeichen beendet den JSON-Text vorzeitig;
++					*  ist das Schlusszeichen maskiert („…\"), faellt der Backslash mit weg. */
++					try {
++						const parsed = JSON.parse(value.replace(/„([^"“”\n\\]*)\\?"/g, "„$1“"));
++						return Array.isArray(parsed) ? parsed : value;
++					} catch {
++						return value;
++					}
++				}
++			};
++			if (candidate != null && typeof candidate === "object") {
++				if ("questions" in candidate) candidate.questions = parseJsonList(candidate.questions);
++				if (Array.isArray(candidate.questions)) for (const question of candidate.questions) {
++					if (question == null || typeof question !== "object") continue;
++					if ("options" in question) question.options = parseJsonList(question.options);
++					/** Fehlt der Fragetext, steht er meist in description oder header */
++					if (typeof question.question !== "string" || question.question.trim() === "") {
++						if (typeof question.description === "string" && question.description.trim() !== "") {
++							question.question = question.description.slice(0, QUESTION_MAX);
++							delete question.description;
++						} else if (typeof question.header === "string" && question.header.trim() !== "") question.question = question.header;
++					}
++					if (typeof question.header === "string" && question.header.length > HEADER_MAX) question.header = question.header.slice(0, HEADER_MAX);
++				}
++				if ("options" in candidate) candidate.options = parseJsonList(candidate.options);
++			}
+ 			if (legacyAskUserQuestionToolSchema.safeParse(candidate).success) return await legacyAskTool.invoke(input, config);
+ 			return await invoke(input, config);
+ 		} catch (error) {

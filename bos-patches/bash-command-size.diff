@@ -1,0 +1,21 @@
+--- a/node_modules/@librechat/agents/dist/cjs/tools/BashExecutor.cjs	2026-10-29 17:18:21.340350578 +0100
++++ b/node_modules/@librechat/agents/dist/cjs/tools/BashExecutor.cjs	2026-10-29 17:18:21.232352301 +0100
+@@ -114,6 +114,7 @@
+ 	};
+ }
+ const BashExecutionToolName = "bash_tool";
++const BOS_MAX_COMMAND_BYTES = 120000;
+ function quoteBashArgument(value) {
+ 	return `'${value.replace(/'/g, "'\"'\"'")}'`;
+ }
+@@ -136,6 +137,10 @@
+ 		const { authHeaders, baseUrl: _baseUrl, executionProfile, runtimeSessionHint, statefulSessions, workspaceId: _workspaceId, workspaceInstanceId: _workspaceInstanceId, ...executionParams } = params ?? {};
+ 		const { command: rawCommand, intent: _ignoredIntent, runtime_session_hint: _ignoredModelHint, workspace_instance_id: _ignoredModelWorkspaceInstanceId, args, ...rest } = rawInput;
+ 		const command = hasWorkspace ? commandWithArguments(rawCommand, args) : rawCommand;
++		/** BOS-Patch: Die Sandbox uebergibt den Befehl als ein Programmargument; Linux begrenzt das auf 128 KiB (E2BIG),
++		 * die Code API meldet dann nur "temporarily unavailable". Eingesetzte Werkzeugausgaben ({{toolNturnM}}) zaehlen mit. */
++		const commandBytes = Buffer.byteLength(command, "utf8") + (!hasWorkspace && Array.isArray(args) ? args.reduce((n, a) => n + Buffer.byteLength(String(a), "utf8"), 0) : 0);
++		if (commandBytes > BOS_MAX_COMMAND_BYTES) throw new Error(`The command and its args are ${commandBytes} bytes long (including substituted tool outputs); the sandbox accepts at most ${BOS_MAX_COMMAND_BYTES} bytes per command. Retrying will fail again. Do not pass this output to code: request fewer items or fields from the tool, or a count from the tool itself, and work with that.`);
+ 		const { session_id, _injected_files, _runtime_session_hint } = config.toolCall ?? {};
+ 		const postData = {
+ 			lang: "bash",
