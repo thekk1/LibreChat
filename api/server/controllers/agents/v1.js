@@ -1737,8 +1737,12 @@ const getListAgentsHandler = async (req, res) => {
     const filter = {};
 
     // Handle category filter - only apply if category is defined
-    if (category !== undefined && category.trim() !== '') {
+    if (category !== undefined && category.trim() !== '' && category !== 'system') {
       filter.category = category;
+    } else {
+      /** BOS-Patch: system agents (the preset agents and their subagents) never show in agent
+       *  lists; presets and subagents still load them by ID with the public VIEW grant. */
+      filter.category = { $ne: 'system' };
     }
 
     // Handle promoted filter - only from query param
