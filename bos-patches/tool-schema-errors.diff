@@ -1,0 +1,11 @@
+--- a/node_modules/@langchain/core/dist/tools/index.cjs
++++ b/node_modules/@langchain/core/dist/tools/index.cjs
+@@ -47,7 +47,7 @@
+ 	* an agent should stop looping.
+ 	*/
+ 	returnDirect = false;
+-	verboseParsingErrors = false;
++	verboseParsingErrors = true;
+ 	get lc_namespace() {
+ 		return ["langchain", "tools"];
+ 	}
