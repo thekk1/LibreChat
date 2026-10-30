@@ -66,6 +66,7 @@ const {
   getTransactionsConfig,
   checkToolRolePermission,
   resolveToolRolePermissions,
+  MCPOAuthHandler,
 } = require('@librechat/api');
 const {
   Time,
@@ -813,6 +814,7 @@ async function loadToolDefinitionsWrapper({
   signal,
   upstreamTokenProvider: suppliedUpstreamTokenProvider,
   upstreamTokenProviderResolver,
+  skipMCPOAuthWait = false,
 }) {
   if (!agent.tools || agent.tools.length === 0) {
     return { toolDefinitions: [] };
@@ -1363,7 +1365,53 @@ async function loadToolDefinitionsWrapper({
     }
   }
 
-  if (pendingOAuthServers.size > 0 && (res || streamId)) {
+  /** BOS-Patch (LibreChat #17306): a subagent connects its MCP servers after the parent streamed
+   *  content. Its sign-in step goes to the first free index of the parent's content instead of
+   *  index 0, which the parent's output holds and where the client drops the step. */
+  let oauthIndexOffset = 0;
+  let subagentSkipsOAuth = false;
+  if (pendingOAuthServers.size > 0 && skipMCPOAuthWait) {
+    let parentContentLength;
+    try {
+      const parts = streamId
+        ? await GenerationJobManager.jobStore?.getContentParts?.(streamId, jobCreatedAt)
+        : null;
+      parentContentLength = Array.isArray(parts?.content) ? parts.content.length : undefined;
+    } catch (error) {
+      logger.warn('[Tool Definitions] Failed to read the parent content for MCP OAuth', error);
+    }
+    if (typeof parentContentLength === 'number') {
+      oauthIndexOffset = parentContentLength;
+      logger.info(`[Tool Definitions] Subagent MCP OAuth step at parent content index ${oauthIndexOffset}`);
+    } else {
+      subagentSkipsOAuth = true;
+    }
+  }
+
+  if (subagentSkipsOAuth) {
+    /** Fallback: leave the tools of servers pending OAuth out and cancel the flow tool loading
+     *  started, like POST /api/mcp/oauth/cancel. While it is pending, the MCP servers panel shows
+     *  the server as connecting, without a sign-in button. */
+    logger.info(
+      `[Tool Definitions] MCP OAuth required for ${pendingOAuthServers.size} server(s); not waiting, their tools are left out`,
+    );
+    for (const serverName of pendingOAuthServers) {
+      try {
+        const flowId = MCPOAuthHandler.generateFlowId(req.user.id, serverName, getTenantId());
+        const flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
+        if (flowState?.status === 'PENDING') {
+          await MCPOAuthHandler.failFlowAndDeleteStateMapping(
+            flowId,
+            flowState,
+            flowManager,
+            'Subagent does not wait for OAuth',
+          );
+        }
+      } catch (error) {
+        logger.warn('[Tool Definitions] Failed to cancel a pending MCP OAuth flow', error);
+      }
+    }
+  } else if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
     logger.info(
       `[Tool Definitions] MCP OAuth required for ${serverNames.length} server(s); emitting events and waiting`,
@@ -1372,7 +1420,7 @@ async function loadToolDefinitionsWrapper({
     const oauthWaitPromises = serverNames.map(async (serverName, index) => {
       try {
         const pendingOAuthStart = await getPendingOAuthStartForEmit(serverName);
-        const oauthStart = createOAuthEmitter(serverName, index);
+        const oauthStart = createOAuthEmitter(serverName, oauthIndexOffset + index);
         if (pendingOAuthStart) {
           await oauthStart(pendingOAuthStart.authURL, pendingOAuthStart.options);
         }
@@ -1619,6 +1667,7 @@ async function loadAgentTools({
   accessibleMcpServerNames,
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
+  skipMCPOAuthWait = false,
 }) {
   if (definitionsOnly) {
     try {
@@ -1636,6 +1685,7 @@ async function loadAgentTools({
         signal,
         upstreamTokenProvider,
         upstreamTokenProviderResolver,
+        skipMCPOAuthWait,
       });
     } catch (error) {
       if (
