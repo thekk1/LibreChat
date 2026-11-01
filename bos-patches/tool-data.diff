@@ -1,0 +1,60 @@
+--- a/api/server/controllers/agents/callbacks.js
++++ b/api/server/controllers/agents/callbacks.js
+@@ -1,4 +1,5 @@
+ const { nanoid } = require('nanoid');
++const bosToolData = require('/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs');
+ const { logger } = require('@librechat/data-schemas');
+ const {
+   Tools,
+@@ -523,6 +524,17 @@
+     replayEvents: toolTimingReplayEvents,
+     emit: emitForJob,
+   });
++  /** BOS-Patch: {{data:ID}} im Antworttext wird vor Anzeige und Speicherung eingesetzt. */
++  const answerFilter = bosToolData.createAnswerFilter();
++  const deliverMessageDelta = async (event, data, metadata) => {
++    aggregateContent({ event, data });
++    if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
++      await emitForJob({ event, data });
++    } else if (!metadata?.hide_sequential_outputs) {
++      await emitForJob({ event, data });
++    }
++  };
++
+   const handlers = {
+     [StepEvents.ON_TOOL_CALLS_DISPATCHED]: toolTiming.dispatch,
+     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(
+@@ -698,12 +710,10 @@
+        * @param {StreamEventData} data - The event data.
+        * @param {GraphRunnableConfig['configurable']} [metadata] The runnable metadata.
+        */
+-      handle: async (event, data, metadata) => {
+-        aggregateContent({ event, data });
+-        if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
+-          await emitForJob({ event, data });
+-        } else if (!metadata?.hide_sequential_outputs) {
+-          await emitForJob({ event, data });
++      handle: async (event, data, metadata, graph) => {
++        const filtered = await answerFilter.filter(data, metadata, graph);
++        if (filtered != null) {
++          await deliverMessageDelta(event, filtered, metadata);
+         }
+       },
+     },
+@@ -890,6 +900,16 @@
+     };
+   }
+ 
++  const modelEndHandler = handlers[GraphEvents.CHAT_MODEL_END];
++  handlers[GraphEvents.CHAT_MODEL_END] = {
++    handle: async (event, data, metadata, graph) => {
++      await answerFilter.flush(metadata, graph, (delta) =>
++        deliverMessageDelta(GraphEvents.ON_MESSAGE_DELTA, delta, metadata),
++      );
++      return modelEndHandler.handle(event, data, metadata, graph);
++    },
++  };
++
+   return handlers;
+ }
+ 
