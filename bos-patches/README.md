@@ -6,9 +6,9 @@ the file from the image, and the patched file is mounted read-only into the cont
 
 | Patch | File in the image | Purpose |
 |---|---|---|
-| `ask-user-question-json.diff` | `packages/api/dist/index.cjs` | `ask_user_question` also accepts `questions` and `options` as JSON text |
+| `ask-user-question-json.diff` | `packages/api/dist/index.cjs` | `ask_user_question` also accepts `questions` and `options` as JSON text; every question needs at least two options |
 | `subagent-result.diff` | `node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs` | a short last message of a subagent keeps its longest earlier text; `{{data:ID}}` in a request is replaced from `bosToolData.cjs` |
-| `tool-data.diff`, `bosToolData.cjs` | `api/server/controllers/agents/callbacks.js`, new file next to `SubagentExecutor.cjs` | lists of 20 or more rows from any tool stay out of the parent agent: they are stored per user and chat in MongoDB (`bostooldata`, 30 days), the parent sees a `[DATA ...]` line and inserts them with `{{data:ID:column}}` in requests and answers |
+| `tool-data.diff`, `bosToolData.cjs` | `api/server/controllers/agents/callbacks.js`, new file next to `SubagentExecutor.cjs` | lists of 20 or more rows from any tool stay out of the parent agent: they are stored per user and chat in MongoDB (`bostooldata`, 30 days), the parent sees a `[DATA ...]` line and inserts them with `{{data:ID:column}}` in requests and answers; more than 100 rows become a `text/markdown` artifact |
 | `bash-command-size.diff` | `node_modules/@librechat/agents/dist/cjs/tools/BashExecutor.cjs` | clear error for bash commands above 120 000 bytes instead of "temporarily unavailable" |
 | `tool-schema-errors.diff` | `node_modules/@langchain/core/dist/tools/index.cjs` | a schema error of a tool call names the field and the allowed values |
 | `client-bundle-mkpatch.js` | chunks in `client/dist/assets` and `client/dist/sw.js` | file table with 100 rows per page, legal footer links in a new tab, new service worker revision |

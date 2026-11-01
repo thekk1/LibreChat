@@ -1,6 +1,50 @@
 --- a/packages/api/dist/index.cjs
 +++ b/packages/api/dist/index.cjs
-@@ -47244,6 +47244,40 @@
+@@ -47094,8 +47094,8 @@
+ 	"when you are genuinely blocked on decisions you cannot resolve from the conversation or your",
+ 	"other tools. Put every related question in this ONE tool call, and NEVER call this tool in",
+ 	"parallel with any other tool call. Use stable, concise ids matching",
+-	"[A-Za-z][A-Za-z0-9_-]{0,63}. When the realistic",
+-	"answers are enumerable, provide 2-6 concise options; set multiSelect to true only when",
++	"[A-Za-z][A-Za-z0-9_-]{0,63}. Always provide 2-6",
++	"concise options with the likely answers, also for open questions; set multiSelect to true only when",
+ 	"several options may sensibly apply at once (the selected option values are returned joined",
+ 	`by ", "). Keep every option label within ${OPTION_LABEL_MAX} characters and put supporting`,
+ 	"context in the question description. The user can always type a free-form answer instead — so",
+@@ -47116,7 +47116,7 @@
+ 	options: zod.z.array(zod.z.object({
+ 		label: zod.z.string().min(1).max(OPTION_LABEL_MAX, OPTION_LABEL_MAX_ERROR).describe(OPTION_LABEL_DESCRIPTION),
+ 		value: zod.z.string().min(1).max(OPTION_VALUE_MAX).describe("Value returned as the answer if this option is picked.")
+-	})).max(OPTIONS_MAX).optional().describe("Optional pre-defined choices (2-6 recommended). Omit to require a free-form answer."),
++	})).min(2).max(OPTIONS_MAX).describe("Required: 2-6 pre-defined choices with the likely answers. The user can still type a free-form answer."),
+ 	multiSelect: zod.z.boolean().optional().describe("Allow the user to pick several options; their values are returned joined by \", \".")
+ });
+ const askUserQuestionsArraySchema = zod.z.array(askUserQuestionItemSchema).min(1).max(_librechat_agents.MAX_ASK_USER_QUESTIONS).refine((questions) => new Set(questions.map((question) => question.id)).size === questions.length, { message: "Question ids must be unique." }).describe("One to four related questions presented to the user in one interaction.");
+@@ -47167,8 +47167,9 @@
+ 					},
+ 					options: {
+ 						type: "array",
++						minItems: 2,
+ 						maxItems: OPTIONS_MAX,
+-						description: "Optional pre-defined choices. Omit for free-form only.",
++						description: "Required: 2-6 pre-defined choices with the likely answers. The user can still type a free-form answer.",
+ 						items: {
+ 							type: "object",
+ 							properties: {
+@@ -47193,7 +47194,11 @@
+ 						description: "Allow several option values for this question."
+ 					}
+ 				},
+-				required: ["id", "question"]
++				required: [
++					"id",
++					"question",
++					"options"
++				]
+ 			}
+ 		} },
+ 		required: ["questions"]
+@@ -47244,6 +47249,40 @@
  	askTool.invoke = (async (input, config) => {
  		try {
  			const candidate = typeof input === "object" && input != null && "args" in input ? input.args : input;

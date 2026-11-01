@@ -237,7 +237,12 @@ function formatRows(set, wanted) {
 	return [`| ${columns.join(" | ")} |`, `|${columns.map(() => "---").join("|")}|`, ...set.rows.map((row) => `| ${columns.map((name) => escape(row[name])).join(" | ")} |`)].join("\n");
 }
 /** Setzt Verweise ein. Nur Daten desselben Nutzers und Chats sind erreichbar. */
-async function expand(text, { user, conversationId }) {
+/** Lange Listen gehoeren in ein Artefakt, nicht in den Chatverlauf. */
+function artifactBlock(set, wanted, body) {
+	const slug = [set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 60);
+	return `\n\n:::artifact{identifier="daten-${slug}" type="text/markdown" title="${set.rows.length} Einträge"}\n\`\`\`\`\n${body.replace(/`{4,}/g, "```")}\n\`\`\`\`\n:::\n\n`;
+}
+async function expand(text, { user, conversationId, wrapAt }) {
 	const unknown = [];
 	const refs = [...text.matchAll(REF_PATTERN)];
 	if (refs.length === 0) return { text, unknown };
@@ -253,57 +258,78 @@ async function expand(text, { user, conversationId }) {
 			unknown.push(set ? `${ref[1]}: no column ${missing.join(", ")} (columns: ${set.columns.join(", ")})` : ref[1]);
 			continue;
 		}
-		replacements.set(ref[0], formatRows(set, wanted));
+		replacements.set(ref[0], { set, wanted, body: formatRows(set, wanted) });
 	}
 	return {
-		text: text.replace(REF_PATTERN, (ref) => replacements.get(ref) ?? ref),
+		text: text.replace(REF_PATTERN, (ref, _id, _columns, offset) => {
+			const found = replacements.get(ref);
+			if (!found) return ref;
+			return found.set.rows.length > ARTIFACT_ROWS && wrapAt?.(offset) ? artifactBlock(found.set, found.wanted, found.body) : found.body;
+		}),
 		unknown
 	};
 }
 const PARTIAL_REF = /\{(?:\{(?:d(?:a(?:t(?:a(?::[^{}\n]{0,200}\}?)?)?)?)?)?)?$/;
+const ARTIFACT_ROWS = 100;
+const ARTIFACT_MARK = /:::artifact\{|(?:^|\n):::[ \t]*(?=\n|$)/g;
+const TABLE_TAIL = /(^|\n)\|[^\n]*(?:\n(?:\|[ :|-]*\n?)?)?$/;
+const MODEL_HEADER_TABLE = /(\|[^\n]*\|[ \t]*\n\|[ :|-]+\|[ \t]*\n)\|[^\n]*\|\n\|(?:---\|)+\n/g;
+const MODEL_HEADER_ARTIFACT = /(\|[^\n]*\|[ \t]*\n\|[ :|-]+\|[ \t]*\n)\n*(:::artifact\{[^\n]*\n````\n)\|[^\n]*\|\n\|(?:---\|)+\n/g;
 /** Antworttext des Hauptagenten. Ein Verweis kann ueber mehrere Textstuecke verteilt ankommen. */
 function createAnswerFilter() {
 	const buffers = /* @__PURE__ */ new Map();
 	const tails = /* @__PURE__ */ new Map();
-	/** Schreibt das Modell selbst einen Tabellenkopf vor den Verweis, faellt der eingesetzte weg. */
-	const dropSecondHeader = (id, output) => {
-		const tail = tails.get(id) ?? "";
-		const joined = (tail + output).replace(/(\|[ :|-]+\|[ \t]*\n)\|[^\n]*\|\n\|(?:---\|)+\n/g, "$1");
-		return joined.slice(tail.length);
+	const insideArtifact = /* @__PURE__ */ new Map();
+	const isInside = (id, text) => {
+		let inside = insideArtifact.get(id) ?? false;
+		for (const mark of ((tails.get(id) ?? "") + text).matchAll(ARTIFACT_MARK)) inside = mark[0].includes("artifact");
+		return inside;
 	};
-	const resolve = async (text, metadata, graph) => {
+	const track = (id, text) => {
+		insideArtifact.set(id, isInside(id, text));
+		tails.set(id, ((tails.get(id) ?? "") + text).slice(-16));
+	};
+	/** Verweis und ein davorstehender Tabellenkopf muessen im selben Stueck ankommen. */
+	const holdFrom = (text) => {
+		const partial = text.match(PARTIAL_REF);
+		const end = partial ? partial.index : text.length;
+		const header = text.slice(0, end).match(TABLE_TAIL);
+		return header ? header.index + header[1].length : end;
+	};
+	/** Schreibt das Modell selbst einen Tabellenkopf vor den Verweis, gilt seiner statt des eingesetzten. */
+	const mergeHeaders = (text) => text.replace(MODEL_HEADER_ARTIFACT, "\n$2$1").replace(MODEL_HEADER_TABLE, "$1");
+	const render = async (id, text, metadata, graph) => {
 		const result = await expand(text, {
 			user: graph?.config?.configurable?.user_id,
-			conversationId: metadata?.thread_id
+			conversationId: metadata?.thread_id,
+			wrapAt: (offset) => !isInside(id, text.slice(0, offset))
 		});
 		if (result.unknown.length > 0) console.error("[bosToolData] unknown reference in answer", result.unknown);
 		let output = result.text;
 		for (const problem of result.unknown) output = output.replace(new RegExp(`\\{\\{data:${problem.slice(0, 8)}[^{}\\n]*\\}\\}`, "g"), `[Daten ${problem.slice(0, 8)} nicht verfuegbar]`);
+		if (text.includes("{{data:")) output = mergeHeaders(output);
+		track(id, text);
 		return output;
 	};
 	return {
 		async filter(data, metadata, graph) {
 			const parts = data?.delta?.content;
 			if (!Array.isArray(parts) || parts.length !== 1 || parts[0]?.type !== "text" || typeof parts[0].text !== "string") return data;
-			if (!buffers.has(data.id) && !parts[0].text.includes("{")) {
-				tails.set(data.id, ((tails.get(data.id) ?? "") + parts[0].text).slice(-300));
+			if (!buffers.has(data.id) && !/[{|]/.test(parts[0].text)) {
+				track(data.id, parts[0].text);
 				return data;
 			}
 			const combined = (buffers.get(data.id) ?? "") + parts[0].text;
-			const held = combined.match(PARTIAL_REF)?.[0] ?? "";
-			const ready = combined.slice(0, combined.length - held.length);
-			if (held) buffers.set(data.id, held);
+			const start = holdFrom(combined);
+			const ready = combined.slice(0, start);
+			if (start < combined.length) buffers.set(data.id, combined.slice(start));
 			else buffers.delete(data.id);
 			if (ready === "") return null;
-			const hasRef = ready.includes("{{data:");
-			const resolved = await resolve(ready, metadata, graph);
-			const output = hasRef ? dropSecondHeader(data.id, resolved) : resolved;
-			tails.set(data.id, ((tails.get(data.id) ?? "") + output).slice(-300));
 			return {
 				...data,
 				delta: {
 					...data.delta,
-					content: [{ ...parts[0], text: output }]
+					content: [{ ...parts[0], text: await render(data.id, ready, metadata, graph) }]
 				}
 			};
 		},
@@ -313,7 +339,7 @@ function createAnswerFilter() {
 				buffers.delete(id);
 				await emit({
 					id,
-					delta: { content: [{ type: "text", text: await resolve(text, metadata, graph) }] }
+					delta: { content: [{ type: "text", text: await render(id, text, metadata, graph) }] }
 				});
 			}
 		}
