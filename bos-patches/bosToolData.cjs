@@ -351,10 +351,15 @@ async function lookupRefs(texts, { user, conversationIds }) {
 	}
 	return { found, unknown };
 }
-/** In Werkzeugargumenten: eine Spalte als kommagetrennte Liste, mehrere Spalten als JSON-Liste von Objekten. */
+/** In Werkzeugargumenten: eine Spalte als kommagetrennte Liste, mehrere Spalten als JSON-Liste von Objekten.
+ *  Enthaelt ein Wert ein Trennzeichen der Abgleichwerkzeuge (Komma, Semikolon, Zeilenumbruch), wird die
+ *  Spalte eine JSON-Liste von Texten; sonst zerlegte das Werkzeug etwa einen Betreff "Angebot, Teil 2". */
 function formatForTool(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
-	if (columns.length === 1) return set.rows.map((row) => row[columns[0]] ?? "").join(", ");
+	if (columns.length === 1) {
+		const values = set.rows.map((row) => String(row[columns[0]] ?? ""));
+		return values.some((value) => /[,;\r\n]/.test(value)) ? JSON.stringify(values) : values.join(", ");
+	}
 	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? ""]))));
 }
 function stringsOf(value, out = []) {
