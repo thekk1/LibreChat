@@ -37,13 +37,23 @@ function messageText(message) {
 function parseJson(text) {
 	const starts = [text.indexOf("{"), text.indexOf("[")].filter((index) => index >= 0);
 	if (starts.length === 0) return void 0;
+	const start = Math.min(...starts);
 	const end = Math.max(text.lastIndexOf("}"), text.lastIndexOf("]"));
-	if (end <= Math.min(...starts)) return void 0;
+	if (end <= start) return void 0;
 	try {
-		return JSON.parse(text.slice(Math.min(...starts), end + 1));
-	} catch {
-		return void 0;
+		return JSON.parse(text.slice(start, end + 1));
+	} catch {}
+	/** Beginnt der Text mit JSON, darf danach noch Text stehen, etwa "[instance: ...]" von trac-mcp. */
+	if (text.slice(0, start).trim() !== "") return void 0;
+	const close = text[start] === "{" ? "}" : "]";
+	let candidate = text.lastIndexOf(close, end);
+	for (let attempt = 0; attempt < 5 && candidate > start; attempt++) {
+		try {
+			return JSON.parse(text.slice(start, candidate + 1));
+		} catch {}
+		candidate = text.lastIndexOf(close, candidate - 1);
 	}
+	return void 0;
 }
 const isScalar = (value) => value === null || typeof value !== "object";
 function cell(value) {
@@ -84,19 +94,58 @@ function jsonLists(value, path, depth, found) {
 	}
 	for (const [name, entry] of entries) jsonLists(entry, path ? `${path}.${name}` : name, depth + 1, found);
 }
+const PIPE_ROW = /^\s*\|.*\|\s*$/;
+const SEPARATOR_ROW = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
 function lineSignature(line) {
+	const tabs = line.trim().match(/\t/g);
+	if (tabs) return `tab${tabs.length}`;
 	const prefix = line.match(/^\s*([-*•]|\d+[.)]|\|)\s/);
 	if (prefix) return prefix[1].replace(/\d+/, "9");
 	if (line.length > 120) return null;
 	return line.trim().replace(/[\p{L}]+/gu, "a").replace(/\d+/g, "9").replace(/\s+/g, " ");
 }
-/** Textergebnisse: Folgen gleich aufgebauter Zeilen, etwa "- #123: ..." von Trac. */
+/** Zellen einer Tabellenzeile ("| a | b |") oder einer Zeile mit Tabulatoren, sonst null. */
+function splitCells(line) {
+	if (PIPE_ROW.test(line)) return line.trim().slice(1, -1).split(/(?<!\\)\|/).map((value) => value.trim().replace(/\\\|/g, "|"));
+	if (line.trim().includes("\t")) return line.trim().split("\t").map((value) => value.trim());
+	return null;
+}
+/** Spaltennamen aus einer Kopfzeile; leere oder doppelte Namen werden c1, c2, ... */
+function columnNames(header, width) {
+	const names = [];
+	for (let index = 0; index < width; index++) {
+		const name = String(header?.[index] ?? "").replace(/[{}:,]/g, " ").replace(/\s+/g, " ").trim();
+		names.push(name !== "" && !names.includes(name) ? name : `c${index + 1}`);
+	}
+	return names;
+}
+/** Zeilen mit gleich vielen Zellen werden Spalten, mit Kopfzeile davor (Tabelle) oder c1, c2, ... */
+function splitRows(lines, before) {
+	let header = null;
+	let body = lines;
+	if (body.length > 1 && SEPARATOR_ROW.test(body[1]) && PIPE_ROW.test(body[0])) {
+		header = splitCells(body[0]);
+		body = body.slice(2);
+	} else if (before.length >= 2 && SEPARATOR_ROW.test(before[1]) && PIPE_ROW.test(before[0])) header = splitCells(before[0]);
+	body = body.filter((line) => !SEPARATOR_ROW.test(line));
+	const cells = body.map(splitCells);
+	const width = cells[0]?.length ?? 0;
+	if (width < 2 || cells.some((row) => row === null || row.length !== width)) return null;
+	const names = columnNames(header?.length === width ? header : null, width);
+	return cells.map((row) => Object.fromEntries(names.map((name, index) => [name, cell(row[index])])));
+}
+/** Textergebnisse: Folgen gleich aufgebauter Zeilen, etwa "- #123: ..." von Trac oder eine Tabelle aus Code. */
 function textLists(text) {
 	const found = [];
+	const lines = text.split("\n");
 	let run = [];
+	let runStart = 0;
 	let signature = null;
 	const flush = () => {
-		if (run.length >= MIN_ROWS) found.push({
+		const before = lines.slice(Math.max(0, runStart - 2), runStart);
+		const split = run.length >= MIN_ROWS ? splitRows(run, before) : null;
+		if (split && split.length >= MIN_ROWS) found.push({ field: "table", rows: split });
+		else if (run.length >= MIN_ROWS) found.push({
 			field: "lines",
 			rows: run.map((line) => {
 				const body = line.replace(/^\s*([-*•]|\d+[.)]|\|)\s+/, "").trim();
@@ -105,14 +154,15 @@ function textLists(text) {
 		});
 		run = [];
 	};
-	for (const line of text.split("\n")) {
+	lines.forEach((line, index) => {
 		const next = line.trim() === "" ? null : lineSignature(line);
 		if (next === null || next !== signature) {
 			flush();
 			signature = next;
+			runStart = index;
 		}
 		if (next !== null) run.push(line);
-	}
+	});
 	flush();
 	return found;
 }
@@ -198,6 +248,19 @@ function stripTyped(content, set) {
 	}
 	return lines.join("\n");
 }
+/** Zahl der Spalten, deren Werte zur Haelfte im Text stehen: Welche Menge hat der Subagent abgetippt? */
+function typedColumns(content, set) {
+	let count = 0;
+	for (const name of set.columns) {
+		const values = set.rows.slice(0, 200).map((row) => String(row[name] ?? "").trim()).filter((value) => value.length >= 3 && value.length <= 200);
+		if (values.length > 0 && values.filter((value) => content.includes(value)).length >= values.length / 2) count++;
+	}
+	return count;
+}
+/** Reihenfolge fuer stripTyped: die passendste Menge zuerst, bei Gleichstand die mit mehr Spalten. */
+function rankForStrip(content, sets) {
+	return sets.map((set, index) => ({ set, index, score: typedColumns(content, set) })).sort((a, b) => b.score - a.score || b.set.columns.length - a.set.columns.length || a.index - b.index).map(({ set }) => set);
+}
 /** Wird am Ende jedes Subagenten aufgerufen: speichert Listen, ersetzt sie im Text, haengt Griffe an. */
 async function collect({ content, messages, user, conversationId }) {
 	if (!user || !conversationId) return content;
@@ -227,7 +290,7 @@ async function collect({ content, messages, user, conversationId }) {
 		stored.push(set);
 	}
 	let text = content;
-	for (const set of stored) text = stripTyped(text, set);
+	for (const set of rankForStrip(text, stored)) text = stripTyped(text, set);
 	return stored.length === 0 ? text : `${text}\n\n${stored.map(handleLine).join("\n")}`;
 }
 function formatRows(set, wanted) {
@@ -345,4 +408,4 @@ function createAnswerFilter() {
 		}
 	};
 }
-module.exports = { collect, expand, createAnswerFilter, extract, stripTyped, handleLine, messageText };
+module.exports = { collect, expand, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };
