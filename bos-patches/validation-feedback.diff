@@ -1,0 +1,32 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -91747,15 +91747,26 @@
+ 	}
+ 	const missing = fields.length ? ` Missing required fields: ${fields.join(", ")}.` : "";
+ 	const invalid = [];
+-	if (schema != null && typeof schema === "object" && "properties" in schema && schema.properties != null && typeof schema.properties === "object" && input != null && typeof input === "object") for (const [field, property] of Object.entries(schema.properties).slice(0, MAX_FIELDS)) {
+-		if (!Object.prototype.hasOwnProperty.call(input, field) || property == null || typeof property !== "object" || !("type" in property)) continue;
++	/** BOS-Patch: alle Felder pruefen (nicht nur die ersten acht), dazu integer und enum mit den erlaubten Werten */
++	const properties = schema != null && typeof schema === "object" && schema.properties != null && typeof schema.properties === "object" ? schema.properties : null;
++	if (properties != null && input != null && typeof input === "object") for (const [field, property] of Object.entries(properties)) {
++		if (invalid.length >= MAX_FIELDS) break;
++		if (!Object.prototype.hasOwnProperty.call(input, field) || property == null || typeof property !== "object") continue;
+ 		const type = property.type;
+ 		const value = Object.getOwnPropertyDescriptor(input, field)?.value;
+ 		if ((type === "string" || type === "boolean" || type === "number") && typeof value !== type) invalid.push(`${safeName(field)} (expected ${type})`);
++		else if (type === "integer" && !Number.isInteger(value)) invalid.push(`${safeName(field)} (expected integer)`);
++		else if (Array.isArray(property.enum) && !property.enum.includes(value)) invalid.push(`${safeName(field)} (allowed: ${property.enum.slice(0, MAX_FIELDS).map((v) => safeName(String(v))).join(", ")})`);
+ 	}
+ 	const invalidTypes = invalid.length ? ` Invalid field types: ${invalid.join(", ")}.` : "";
++	/** BOS-Patch: undeklarierte Argumente zaehlen und die deklarierten nennen; nur Namen aus dem Schema, keine Eingabe */
++	let undeclared = "";
++	if (properties != null && input != null && typeof input === "object" && !Array.isArray(input)) {
++		const count = Object.keys(input).filter((key) => !Object.prototype.hasOwnProperty.call(properties, key)).length;
++		if (count > 0) undeclared = ` ${count} undeclared argument(s) passed. Declared arguments: ${Object.keys(properties).slice(0, 2 * MAX_FIELDS).map(safeName).join(", ") || "none"}.`;
++	}
+ 	const polling = canCheckBackground && input != null && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "background_task_id") ? " To inspect an existing background task, call check_background_task with background_task_id." : "";
+-	return `Tool "${safeName(toolName)}" input failed schema validation.${missing}${invalidTypes} Use this tool's declared arguments.${polling}`;
++	return `Tool "${safeName(toolName)}" input failed schema validation.${missing}${invalidTypes}${undeclared} Use this tool's declared arguments.${polling}`;
+ }
+ //#endregion
+ //#region src/skills/cleanup.ts
