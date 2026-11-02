@@ -1,0 +1,45 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -99549,6 +99549,33 @@
+ 		}
+ 	};
+ }
++/** BOS-Patch tool-args: Verweise in den Argumenten jedes Werkzeugaufrufs, von Haupt- und Subagenten.
++ *  {{data:D-...}} wird aus bosToolData eingesetzt (nur derselbe Nutzer und Chat). Ein {{toolNturnM}},
++ *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
++ *  Platzhalter als Text. */
++const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
++const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
++async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
++	const user = resolveBackgroundUserId(configurable);
++	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
++	for (const tc of toolCalls) {
++		const text = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {});
++		const outputRefs = [...new Set([...text.matchAll(BOS_TOOL_OUTPUT_REF)].map((match) => `{{${match[1]}}}`))];
++		if (outputRefs.length > 0) {
++			blocked.set(tc, errorResult(tc, `Unknown output reference ${outputRefs.join(", ")}; nothing was run. A result can be referenced only by the key on its own [ref: toolNturnM] line or _ref field, exactly as shown there; a result without one is no longer stored. Fetch the data again or pass the values you need.`));
++			continue;
++		}
++		if (!text.includes("{{data:")) continue;
++		try {
++			const { args, unknown } = await bosToolData.expandArgs(tc.args, { user, conversationIds });
++			if (unknown.length > 0) blocked.set(tc, errorResult(tc, `Unknown data reference ${unknown.join("; ")}; nothing was run. Use only references from [DATA] lines of this chat, or have the data fetched again.`));
++			else tc.args = args;
++		} catch (error) {
++			_librechat_data_schemas.logger.error("[bosToolData] tool arguments", error);
++			blocked.set(tc, errorResult(tc, "Data references could not be resolved; nothing was run. Try again later."));
++		}
++	}
++}
+ function createToolExecuteHandler(options) {
+ 	const { runSignal: hostRunSignal, foregroundRunId, loadTools, toolEndCallback, eventActorDetachedAction, persistBackgroundCodeResult, backgroundToolCompletion, emitAttachment, emitPtcProgress, subagentTasks, runFiles, ordinaryToolCancellation = false, backgroundCompletionResultMaxChars = librechat_data_provider.AGENT_BACKGROUND_COMPLETION_RESULT_MAX_CHARS_DEFAULT, provisionFiles } = options;
+ 	return { handle: async (_event, data) => {
+@@ -99609,6 +99636,8 @@
+ 						if (filteredName != null) preloadedNameBlocks.set(tc, filteredName);
+ 						else allowedToolCalls.push(tc);
+ 					}
++					await bosPrepareToolArgs(allowedToolCalls, preloadedNameBlocks, sourceConfigurable, metadata);
++					for (let index = allowedToolCalls.length - 1; index >= 0; index--) if (preloadedNameBlocks.has(allowedToolCalls[index])) allowedToolCalls.splice(index, 1);
+ 					if (allowedToolCalls.length === 0) {
+ 						resolve(toolCalls.map((tc) => reportResult(preloadedNameBlocks.get(tc) ?? errorResult(tc, "Submitted tool name was blocked."))));
+ 						return;

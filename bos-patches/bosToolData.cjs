@@ -332,6 +332,64 @@ async function expand(text, { user, conversationId, wrapAt }) {
 		unknown
 	};
 }
+/** Mengen zu den Verweisen in Texten, nur fuer denselben Nutzer und einen der Chats. */
+async function lookupRefs(texts, { user, conversationIds }) {
+	const ids = [...new Set((conversationIds ?? []).filter((id) => typeof id === "string" && id !== ""))];
+	const found = /* @__PURE__ */ new Map();
+	const unknown = [];
+	const refs = [];
+	for (const text of texts) for (const ref of text.matchAll(REF_PATTERN)) if (!refs.some((known) => known[0] === ref[0])) refs.push(ref);
+	if (refs.length === 0) return { found, unknown };
+	const col = collection();
+	await indexReady;
+	for (const ref of refs) {
+		const set = !user || ids.length === 0 ? null : await col.findOne({ id: ref[1], user: String(user), conversationId: { $in: ids } });
+		const wanted = (ref[2] ?? "").split(",").map((name) => name.trim()).filter(Boolean);
+		const missing = set ? wanted.filter((name) => !set.columns.includes(name)) : [];
+		if (!set || missing.length > 0) unknown.push(set ? `${ref[1]}: no column ${missing.join(", ")} (columns: ${set.columns.join(", ")})` : ref[1]);
+		else found.set(ref[0], { set, wanted });
+	}
+	return { found, unknown };
+}
+/** In Werkzeugargumenten: eine Spalte als kommagetrennte Liste, mehrere Spalten als JSON-Liste von Objekten. */
+function formatForTool(set, wanted) {
+	const columns = wanted.length > 0 ? wanted : set.columns;
+	if (columns.length === 1) return set.rows.map((row) => row[columns[0]] ?? "").join(", ");
+	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? ""]))));
+}
+function stringsOf(value, out = []) {
+	if (typeof value === "string") out.push(value);
+	else if (Array.isArray(value)) for (const item of value) stringsOf(item, out);
+	else if (value !== null && typeof value === "object") for (const item of Object.values(value)) stringsOf(item, out);
+	return out;
+}
+function mapStrings(value, replace) {
+	if (typeof value === "string") return replace(value);
+	if (Array.isArray(value)) return value.map((item) => mapStrings(item, replace));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, mapStrings(item, replace)]));
+	return value;
+}
+/** Setzt Verweise in die Argumente eines Werkzeugaufrufs ein, bevor das Werkzeug laeuft.
+ *  So laufen Listen aus Griffen nie durch ein Modell. */
+async function expandArgs(args, scope) {
+	const texts = stringsOf(args).filter((text) => text.includes("{{data:"));
+	if (texts.length === 0) return { args, unknown: [] };
+	const { found, unknown } = await lookupRefs(texts, scope);
+	if (unknown.length > 0) return { args, unknown };
+	const replace = (text) => text.replace(REF_PATTERN, (ref) => formatForTool(found.get(ref).set, found.get(ref).wanted));
+	return { args: mapStrings(args, replace), unknown };
+}
+/** Auftrag an einen Subagenten: Verweise bleiben stehen, darunter je Menge ihre Zeile [DATA ...]. */
+async function describeRefs(text, scope) {
+	const { found, unknown } = await lookupRefs([text], scope);
+	if (unknown.length > 0 || found.size === 0) return { text, unknown };
+	const sets = [...new Map([...found.values()].map(({ set }) => [set.id, set])).values()];
+	const lines = sets.map((set) => handleLine({ ...set, note: "" }));
+	return {
+		text: `${text}\n\nData references in this request: the system inserts the rows when a tool runs; pass each {{data:...}} unchanged in tool arguments or code, never type its rows.\n${lines.join("\n")}`,
+		unknown
+	};
+}
 const PARTIAL_REF = /\{(?:\{(?:d(?:a(?:t(?:a(?::[^{}\n]{0,200}\}?)?)?)?)?)?)?$/;
 const ARTIFACT_ROWS = 100;
 const ARTIFACT_MARK = /:::artifact\{|(?:^|\n):::[ \t]*(?=\n|$)/g;
@@ -408,4 +466,4 @@ function createAnswerFilter() {
 		}
 	};
 }
-module.exports = { collect, expand, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };
+module.exports = { collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };

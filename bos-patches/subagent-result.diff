@@ -8,7 +8,7 @@
  //#region src/tools/subagent/SubagentExecutor.ts
  const ERROR_MESSAGE_MAX_CHARS = 200;
  const MAX_QUEUED_SUBAGENT_UPDATES = 64;
-@@ -985,7 +986,14 @@
+@@ -985,7 +986,18 @@
  		}
  	}
  	async executeOnce(params, execution, executableConfig) {
@@ -18,13 +18,17 @@
 +			user: params.parentConfigurable?.user_id,
 +			conversationId: params.parentConfigurable?.thread_id
 +		};
-+		const expandedData = await bosToolData.expand(params.description, bosScope);
-+		if (expandedData.unknown.length > 0) return createSubagentFailure(`Subagent error: unknown data reference ${expandedData.unknown.join("; ")}. Have the data fetched again.`);
-+		const description = expandedData.text;
++		/** Verweise bleiben im Auftrag stehen; die Zeilen setzt die Werkzeugausfuehrung ein (expandArgs). */
++		const describedData = await bosToolData.describeRefs(params.description, {
++			user: bosScope.user,
++			conversationIds: [bosScope.conversationId]
++		});
++		if (describedData.unknown.length > 0) return createSubagentFailure(`Subagent error: unknown data reference ${describedData.unknown.join("; ")}. Have the data fetched again.`);
++		const description = describedData.text;
  		const childBreaker = params.breaker ?? this.resolveBreakerController();
  		const childSignal = this.composeChildSignal(childBreaker, params.signal);
  		const { parentToolCallId: executionSuffix } = execution.address;
-@@ -1340,7 +1348,15 @@
+@@ -1340,7 +1352,15 @@
  		}
  		const childTerminalAt = Date.now();
  		if (result == null) throw new Error("Subagent completed without producing graph state.");
@@ -41,7 +45,7 @@
  		if (!childAlreadyCompleted && this.hookRegistry?.hasHookFor("SubagentStop", currentHookSessionId) === true) await require_executeHooks.executeHooks({
  			registry: this.hookRegistry,
  			input: {
-@@ -1895,7 +1911,21 @@
+@@ -1895,7 +1915,21 @@
  	if (result.message == null) return "Task completed";
  	return filterSubagentResult([result.message]);
  }
