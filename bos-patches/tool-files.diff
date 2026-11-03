@@ -206,7 +206,7 @@
  				return formatToolContent(result, provider);
  			} catch (error) {
  				if (error instanceof OAuthRecoveryTakeoverRequired) {
-@@ -99573,6 +99581,29 @@
+@@ -99573,6 +99581,32 @@
   *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
   *  Platzhalter als Text. */
  const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
@@ -214,10 +214,13 @@
 + *  Codeausfuehrung zum Pfad unter /mnt/data (Datei wird vorher in die Sandbox hochgeladen). */
 +const bosToolFiles = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs");
 +function bosCodeUploader(configurable, user) {
++	/** Im Werkzeuglauf steht kein Express-Request in configurable; uploadCodeEnvFile braucht davon nur
++	 *  req.user (Kopfzeile User-Id, Claims der Code-API). */
++	const req = configurable?.req ?? { user: { ...configurable?.user ?? {}, id: user } };
 +	return async (doc) => {
 +		const { uploadCodeEnvFile } = require("/app/api/server/services/Files/Code/crud.js");
 +		const uploaded = await uploadCodeEnvFile({
-+			req: configurable.req,
++			req,
 +			stream: require("fs").createReadStream(doc.diskPath),
 +			filename: doc.name,
 +			kind: "user",
@@ -236,14 +239,14 @@
  const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
  async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
  	const user = resolveBackgroundUserId(configurable);
-@@ -99584,7 +99615,25 @@
+@@ -99584,7 +99618,25 @@
  			blocked.set(tc, errorResult(tc, `Unknown output reference ${outputRefs.join(", ")}; nothing was run. A result can be referenced only by the key on its own [ref: toolNturnM] line or _ref field, exactly as shown there; a result without one is no longer stored. Fetch the data again or pass the values you need.`));
  			continue;
  		}
 -		if (!text.includes("{{data:")) continue;
 +		if (text.includes("{{file:") && tc.name !== "subagent") try {
 +			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
-+			if (isCode && !configurable?.req) throw new Error("no request for the code upload");
++			if (isCode && !user) throw new Error("no user for the code upload");
 +			const { args, unknown, codeFiles } = await bosToolFiles.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeUploader(configurable, user) : null);
 +			if (unknown.length > 0) {
 +				blocked.set(tc, errorResult(tc, `Unknown file reference ${unknown.join("; ")}; nothing was run. Use only IDs from [FILE] lines of this chat or names of files in this chat.`));
