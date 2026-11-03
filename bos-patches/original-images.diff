@@ -1,0 +1,225 @@
+--- a/api/server/services/Files/Local/images.js
++++ b/api/server/services/Files/Local/images.js
+@@ -28,10 +28,36 @@
+  *            - width: The width of the converted image.
+  *            - height: The height of the converted image.
+  */
++/** BOS: Formate, die der Browser anzeigt, bleiben im Original; nur HEIC/HEIF wandelt LibreChat um. */
++const BOS_ORIGINAL_FORMATS = { png: 'image/png', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
++
++/** BOS: Abmessungen und Typ des unveraenderten Bildes, oder null, wenn es umgewandelt werden muss. */
++async function bosOriginalImageInfo(buffer) {
++  const meta = await sharp(buffer).metadata();
++  const type = BOS_ORIGINAL_FORMATS[meta.format];
++  if (!type || !meta.width || !meta.height) {
++    return null;
++  }
++  const swap = (meta.orientation ?? 1) >= 5;
++  return { type, width: swap ? meta.height : meta.width, height: swap ? meta.width : meta.height };
++}
++
+ async function uploadLocalImage({ req, file, file_id, endpoint, resolution = 'high' }) {
+   const appConfig = req.config;
+   const inputFilePath = file.path;
+   const inputBuffer = await fs.promises.readFile(inputFilePath);
++
++  /* BOS: Original speichern statt verkleinert und neu kodiert. Fuer das Modell verkleinert
++   * encodeAndFormatImages (packages/api) beim Senden. */
++  const original = await bosOriginalImageInfo(inputBuffer).catch(() => null);
++  if (original) {
++    const userDir = path.join(appConfig.paths.imageOutput, req.user.id);
++    await fs.promises.mkdir(userDir, { recursive: true });
++    const fileName = `${file_id}__${path.basename(inputFilePath)}`;
++    await fs.promises.writeFile(path.join(userDir, fileName), inputBuffer);
++    const filepath = path.posix.join('/', 'images', req.user.id, fileName);
++    return { filepath, bytes: inputBuffer.length, width: original.width, height: original.height, type: original.type };
++  }
+   const {
+     buffer: resizedBuffer,
+     width,
+@@ -157,4 +183,4 @@
+   return url;
+ }
+ 
+-module.exports = { uploadLocalImage, encodeImage, prepareImagesLocal, processLocalAvatar };
++module.exports = { bosOriginalImageInfo, uploadLocalImage, encodeImage, prepareImagesLocal, processLocalAvatar };
+--- a/api/server/services/Files/process.js
++++ b/api/server/services/Files/process.js
+@@ -488,12 +488,15 @@
+     sttConfigured: isSpeechProviderConfigured(appConfig?.speech?.stt),
+   });
+ 
+-  const { filepath, bytes, width, height, storageKey, storageRegion } = await handleImageUpload({
+-    req,
+-    file,
+-    file_id,
+-    endpoint,
+-  });
++  const { filepath, bytes, width, height, storageKey, storageRegion, type: bosStoredType } =
++    await handleImageUpload({
++      req,
++      file,
++      file_id,
++      endpoint,
++    });
++  /* BOS: uploadLocalImage behaelt das Original; der Typ beschreibt die gespeicherten Bytes. */
++  const storedType = bosStoredType ?? `image/${appConfig.imageOutputType}`;
+   const storageMetadata = getStorageMetadata({ filepath, source, storageKey, storageRegion });
+ 
+   const fileInfo = {
+@@ -506,7 +509,7 @@
+     filename: file.originalname,
+     context: FileContext.message_attachment,
+     source,
+-    type: `image/${appConfig.imageOutputType}`,
++    type: storedType,
+     ...(await retentionExpiryPromise),
+     width,
+     height,
+@@ -517,7 +520,7 @@
+     metadata: {
+       destinationChosen:
+         endpointConfig?.legacyFileUploadUX === true || metadata.tool_resource != null,
+-      ...(`image/${appConfig.imageOutputType}` !== file.mimetype
++      ...(storedType !== file.mimetype
+         ? { routingMimeType: file.mimetype }
+         : {}),
+     },
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -62597,6 +62597,33 @@
+ //#endregion
+ //#region src/files/code/process.ts
+ /** Persists ordinary outputs or explicit publications, returning owned preview work separately. */
++/** BOS: Bilder aus der Codeausfuehrung unveraendert ablegen. Gibt null zurueck, wenn der Browser das
++*  Format nicht anzeigt (dann wandelt convertImage um). Abmessungen nach EXIF-Ausrichtung. */
++async function bosSaveOriginalImage(req, buffer, fileName, getStrategyFunctions, getStorageMetadata) {
++	const { bosOriginalImageInfo } = require("/app/api/server/services/Files/Local/images.js");
++	const info = await bosOriginalImageInfo(buffer).catch(() => null);
++	if (!info) return null;
++	const appConfig = req.config;
++	const { saveBuffer } = getStrategyFunctions(appConfig.fileStrategy);
++	if (!saveBuffer) return null;
++	const filepath = await saveBuffer({
++		userId: req.user.id,
++		buffer,
++		fileName,
++		tenantId: req.user.tenantId
++	});
++	return {
++		filepath,
++		...getStorageMetadata({
++			filepath,
++			source: appConfig.fileStrategy
++		}),
++		bytes: buffer.length,
++		width: info.width,
++		height: info.height,
++		type: info.type
++	};
++}
+ async function processCodeOutput({ req, id, name, toolCallId, conversationId, messageId, session_id, agentId, freshClaimAfter, codeApiBaseUrl, executionProfile = "default", executionRouteKey = executionProfile, bridgeWorkerId, preparedBuffer, downloadFallback, publication }, { getCodeOutputFileSettings, downloadCodeOutputBuffer, createDownloadFallback, getRetentionExpiry, convertImage, getStrategyFunctions, determineFileType, claimCodeFile, commitCodeFile: commitOutput, finalizePreview, hasOfficeHtmlPath, sanitizeArtifactPath, flattenArtifactPath, classifyCodeArtifact, extractCodeArtifactText, getExtractedTextFormat, getStorageMetadata, logAxiosError, logger }) {
+ 	const appConfig = req.config;
+ 	const currentDate = /* @__PURE__ */ new Date();
+@@ -62731,7 +62758,8 @@
+ 		};
+ 		if (isImage) {
+ 			const usage = isUpdate ? (claimed.usage ?? 0) + 1 : 1;
+-			const _file = await convertImage(req, buffer, "high", `${file_id}${fileExt}`);
++			/** BOS: Bild im Original speichern; nur HEIC/HEIF wandelt LibreChat um (bosSaveOriginalImage). */
++			const _file = await bosSaveOriginalImage(req, buffer, `${file_id}${fileExt}`, getStrategyFunctions, getStorageMetadata) ?? await convertImage(req, buffer, "high", `${file_id}${fileExt}`);
+ 			const filepath = usage > 1 ? `${_file.filepath}?v=${Date.now()}` : _file.filepath;
+ 			const storageMetadata = getStorageMetadata({
+ 				filepath: _file.filepath,
+@@ -62745,7 +62773,7 @@
+ 				file_id,
+ 				filepath: _file.filepath,
+ 				filename: safeName,
+-				type: `image/${appConfig.imageOutputType}`,
++				type: _file.type ?? `image/${appConfig.imageOutputType}`,
+ 				user: req.user.id,
+ 				tenantId: req.user.tenantId,
+ 				conversationId,
+@@ -62763,7 +62791,7 @@
+ 				executionProfile,
+ 				user: req.user.id,
+ 				tenantId: req.user.tenantId,
+-				type: `image/${appConfig.imageOutputType}`,
++				type: _file.type ?? `image/${appConfig.imageOutputType}`,
+ 				createdAt: isUpdate ? claimed.createdAt : formattedDate,
+ 				updatedAt: formattedDate,
+ 				source: appConfig.fileStrategy,
+@@ -64032,6 +64060,21 @@
+ 	}
+ };
+ /** Owns source selection, guarded reads, validation and provider-specific image formatting. */
++/** BOS: Bilder liegen im Original vor. Fuer das Modell wie frueher beim Hochladen auf 'high'
++*  verkleinern (kurze Seite 768, lange 2000 Pixel) und nach EXIF ausrichten; kleinere Bilder ohne
++*  Ausrichtung gehen unveraendert. */
++async function bosModelImage(base64, type, endpoint) {
++	const sharp = require("sharp");
++	const buffer = Buffer.from(base64, "base64");
++	const meta = await sharp(buffer).metadata();
++	const longMax = endpoint === librechat_data_provider.EModelEndpoint.anthropic ? 1568 : 2000;
++	const shortSide = Math.min(meta.width ?? 0, meta.height ?? 0);
++	const longSide = Math.max(meta.width ?? 0, meta.height ?? 0);
++	if ((meta.orientation ?? 1) <= 1 && shortSide <= 768 && longSide <= longMax) return { content: base64, type };
++	const { resizeImageBuffer } = require("/app/api/server/services/Files/images/resize.js");
++	const resized = await resizeImageBuffer(buffer, "high", endpoint);
++	return { content: resized.buffer.toString("base64"), type: resized.type ?? type };
++}
+ async function encodeAndFormatImages(req, files, params, { getStrategyFunctions, httpClient }, mode) {
+ 	const { provider, endpoint } = params;
+ 	const effectiveEndpoint = endpoint ?? provider;
+@@ -64087,7 +64130,7 @@
+ 		fileConfig: (0, librechat_data_provider.mergeFileConfig)(req.config.fileConfig),
+ 		endpoint: effectiveEndpoint
+ 	})?.fileSizeLimit;
+-	for (const [file, imageContent] of formattedImages) {
++	for (const [file, storedContent] of formattedImages) {
+ 		const fileMetadata = {
+ 			type: file.type,
+ 			file_id: file.file_id,
+@@ -64101,14 +64144,21 @@
+ 			fileMetadata.width = file.width;
+ 		}
+ 		result.files.push(fileMetadata);
+-		if (!imageContent) continue;
+-		const isURL = imageContent.startsWith("http");
++		if (!storedContent) continue;
++		const isURL = storedContent.startsWith("http");
++		let imageContent = storedContent;
++		let imageType = file.type;
++		if (file.height && file.width && !isURL) try {
++			({ content: imageContent, type: imageType } = await bosModelImage(storedContent, file.type, effectiveEndpoint));
++		} catch (error) {
++			_librechat_data_schemas.logger.warn(`[bosModelImage] ${file.filename}: ${error?.message ?? error}`);
++		}
+ 		if (file.height && file.width && !isURL) {
+ 			const imageBuffer = Buffer.from(imageContent, "base64");
+ 			const validation = await validateImage(imageBuffer, imageBuffer.length, effectiveEndpoint ?? "", configuredFileSizeLimit);
+ 			if (!validation.isValid) throw new Error(`Image validation failed for ${file.filename}: ${validation.error}`);
+ 		}
+-		const url = isURL ? imageContent : `data:${file.type};base64,${imageContent}`;
++		const url = isURL ? imageContent : `data:${imageType};base64,${imageContent}`;
+ 		if (mode === librechat_data_provider.VisionModes.agents) result.image_urls.push({
+ 			type: librechat_data_provider.ContentTypes.IMAGE_URL,
+ 			image_url: {
+@@ -64119,7 +64169,7 @@
+ 		else if (effectiveEndpoint === librechat_data_provider.EModelEndpoint.google && mode === librechat_data_provider.VisionModes.generative) result.image_urls.push({
+ 			type: librechat_data_provider.ContentTypes.IMAGE_URL,
+ 			inlineData: {
+-				mimeType: file.type,
++				mimeType: imageType,
+ 				data: imageContent
+ 			}
+ 		});
+@@ -64131,7 +64181,7 @@
+ 			type: "image",
+ 			source: {
+ 				type: "base64",
+-				media_type: file.type,
++				media_type: imageType,
+ 				data: imageContent
+ 			}
+ 		});

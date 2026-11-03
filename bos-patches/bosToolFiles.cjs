@@ -294,8 +294,14 @@ function parseRef(inner) {
 	return { key: field ? text.slice(0, -field.length - 1) : text, field };
 }
 /** Griff F-... oder Dateiname: zuerst gespeicherte Werkzeugdateien, dann Anhaenge und Ergebnisse der
- *  Codeausfuehrung desselben Chats (neueste zuerst). */
-async function resolve(key, { user, conversationIds }) {
+ *  Codeausfuehrung desselben Chats (neueste zuerst). Ein Pfad wie /mnt/data/x.png zaehlt mit seinem Namen. */
+async function resolve(key, scope) {
+	const found = await resolveExact(key, scope);
+	if (found || !key.includes("/")) return found;
+	const name = key.slice(key.lastIndexOf("/") + 1);
+	return name ? resolveExact(name, scope) : null;
+}
+async function resolveExact(key, { user, conversationIds }) {
 	const ids = scopeIds(conversationIds);
 	if (!user || ids.length === 0) return null;
 	const col = collection();
