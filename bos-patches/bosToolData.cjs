@@ -408,7 +408,7 @@ async function describeRefs(text, scope) {
 	const others = await recentSets(scope, new Set(sets.map((set) => set.id)));
 	const blocks = [];
 	if (sets.length > 0) blocks.push(`Data references in this request: the system inserts the rows when a tool runs; pass each {{data:...}} unchanged in tool arguments or code, never type its rows.\n${sets.map((set) => handleLine({ ...set, note: "" })).join("\n")}`);
-	if (others.length > 0) blocks.push(`Other data sets of this chat, newest first. If the request refers to items it does not list (for example "these keys" or "the tickets above"), take them from the matching set: write {{data:ID:column}} unchanged in tool arguments or code, never type its rows.\n${others.map(handleLine).join("\n")}`);
+	if (others.length > 0) blocks.push(`Other data sets of this chat, newest first. If the request refers to items it does not list (for example "these keys" or "the tickets above") and exactly one set matches it (source and number of rows), take them from that set: write {{data:ID:column}} unchanged in tool arguments or code, never type its rows. If none or several match, do not guess: say which items are missing.\n${others.map(handleLine).join("\n")}`);
 	return { text: blocks.length === 0 ? text : `${text}\n\n${blocks.join("\n\n")}`, unknown };
 }
 /** Angefangener Verweis {{data:...}} oder {{file:...}} am Ende eines Textstuecks. */

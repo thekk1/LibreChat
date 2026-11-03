@@ -239,13 +239,19 @@
  const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
  async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
  	const user = resolveBackgroundUserId(configurable);
-@@ -99584,7 +99618,25 @@
+@@ -99584,7 +99618,31 @@
  			blocked.set(tc, errorResult(tc, `Unknown output reference ${outputRefs.join(", ")}; nothing was run. A result can be referenced only by the key on its own [ref: toolNturnM] line or _ref field, exactly as shown there; a result without one is no longer stored. Fetch the data again or pass the values you need.`));
  			continue;
  		}
 -		if (!text.includes("{{data:")) continue;
 +		if (text.includes("{{file:") && tc.name !== "subagent") try {
 +			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
++			/** BOS: Inhalt als base64 nur fuer MCP-Werkzeuge; eingebaute Werkzeuge wie read_file koennen damit
++			*  nichts anfangen, das Modell bekaeme die Bytes als Text. */
++			if (!isCode && !String(tc.name).includes(librechat_data_provider.Constants.mcp_delimiter)) {
++				blocked.set(tc, errorResult(tc, `{{file:...}} works only in MCP tool arguments, in code (execute_code, bash_tool: it becomes the path under /mnt/data) and in your answer (the user sees the file there); nothing was run. To show a file to the user, write its {{file:...}} in your answer.`));
++				continue;
++			}
 +			if (isCode && !user) throw new Error("no user for the code upload");
 +			const { args, unknown, codeFiles } = await bosToolFiles.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeUploader(configurable, user) : null);
 +			if (unknown.length > 0) {

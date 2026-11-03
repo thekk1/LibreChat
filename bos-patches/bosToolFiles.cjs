@@ -415,7 +415,7 @@ async function describeRefs(text, scope) {
 	const others = await recentLines(scope, new Set(named.map((doc) => doc.id)));
 	const blocks = [];
 	if (named.length > 0) blocks.push(`Files in this request: the system inserts a file when a tool runs; pass each {{file:...}} unchanged in tool arguments or code, never type file contents.\n${named.map(handleLine).join("\n")}`);
-	if (others.length > 0) blocks.push(`Other files of this chat, newest first. If the request refers to a file it does not name, take it from here and pass {{file:ID}} unchanged.\n${others.join("\n")}`);
+	if (others.length > 0) blocks.push(`Other files of this chat, newest first. If the request refers to a file it does not name and exactly one file here matches it, pass {{file:ID}} unchanged; otherwise do not guess.\n${others.join("\n")}`);
 	return { text: blocks.length === 0 ? text : `${text}\n\n${blocks.join("\n\n")}`, unknown };
 }
 
