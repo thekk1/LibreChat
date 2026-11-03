@@ -1,0 +1,33 @@
+--- a/packages/data-schemas/dist/index.cjs
++++ b/packages/data-schemas/dist/index.cjs
+@@ -28202,6 +28202,8 @@
+ //#region src/models/file.ts
+ function createFileModel(mongoose) {
+ 	applyTenantIsolation(file);
++	/** BOS: Speichergrenze je Benutzer (patches/storage-quota/bosStorageQuota.cjs) */
++	require("./bosStorageQuota.cjs").attach(file);
+ 	return mongoose.models.File || mongoose.model("File", file);
+ }
+ //#endregion
+--- a/api/server/routes/files/index.js
++++ b/api/server/routes/files/index.js
+@@ -11,6 +11,8 @@
+ const { avatar: asstAvatarRouter } = require('~/server/routes/assistants/v1');
+ const { avatar: agentAvatarRouter } = require('~/server/routes/agents/v1');
+ const { createMulterInstance } = require('./multer');
++/** BOS: Speichergrenze je Benutzer (patches/storage-quota/bosStorageQuota.cjs) */
++const { uploadGate: bosStorageQuotaGate } = require('/app/packages/data-schemas/dist/bosStorageQuota.cjs');
+ 
+ const files = require('./files');
+ const images = require('./images');
+@@ -56,8 +58,8 @@
+     });
+   });
+ 
+-  router.post('/', upload.single('file'), restoreTenantContextFromReq);
+-  router.post('/images', upload.single('file'), restoreTenantContextFromReq);
++  router.post('/', upload.single('file'), restoreTenantContextFromReq, bosStorageQuotaGate);
++  router.post('/images', upload.single('file'), restoreTenantContextFromReq, bosStorageQuotaGate);
+   router.post('/images/avatar', upload.single('file'), restoreTenantContextFromReq);
+   router.post(
+     '/images/agents/:agent_id/avatar',

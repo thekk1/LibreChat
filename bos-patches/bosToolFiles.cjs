@@ -8,6 +8,8 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+/** Speichergrenze je Benutzer (patches/storage-quota) */
+const quota = require("/app/packages/data-schemas/dist/bosStorageQuota.cjs");
 
 const COLLECTION = "bostoolfiles";
 const TTL_DAYS = 30;
@@ -88,6 +90,7 @@ async function store({ user, conversationId, bytes, name, mime, source }) {
 	const existing = await col.findOne({ id, user: String(user), conversationId });
 	if (existing) return existing;
 	sweep(col).catch((error) => console.error("[bosToolFiles] sweep failed", error));
+	await quota.assertRoom(user, bytes.length);
 	const fileName = safeName(name);
 	const type = mimeOf(fileName, mime);
 	const file_id = crypto.randomUUID();
@@ -132,6 +135,11 @@ async function store({ user, conversationId, bytes, name, mime, source }) {
 	return doc;
 }
 
+/** Hinweis statt Datei, wenn der Speicherplatz des Benutzers voll ist; andere Fehler gehen weiter. */
+function quotaNote(name, error) {
+	if (!quota.isQuotaError(error)) throw error;
+	return `[${name}: ${quota.sizeText(error.bytes)}, not stored: the user's personal file storage is full (${quota.sizeText(error.used)} of ${quota.sizeText(error.limit)} used). Tell the user to delete files under Settings > Data > Manage files.]`;
+}
 /** Bytes als Text, wenn sie gueltiges UTF-8 ohne NUL-Zeichen sind, sonst null. */
 function asText(bytes) {
 	if (bytes.length > MAX_INLINE_TEXT || bytes.includes(0)) return null;
@@ -189,7 +197,15 @@ async function captureJson(value, ctx, docs, depth = 0) {
 			const replaced = { ...value };
 			if (bytes.length > MAX_BYTES) replaced[key] = `[${sizeText(bytes.length)}, larger than ${sizeText(MAX_BYTES)}, not stored]`;
 			else {
-				const doc = await store({ ...ctx, bytes, name: nameOf(value, `${ctx.tool}.bin`), mime: value.mime_type ?? value.mimeType ?? value.content_type ?? value.contentType });
+				const name = nameOf(value, `${ctx.tool}.bin`);
+				let doc;
+				try {
+					doc = await store({ ...ctx, bytes, name, mime: value.mime_type ?? value.mimeType ?? value.content_type ?? value.contentType });
+				} catch (error) {
+					replaced[key] = quotaNote(name, error);
+					ctx.notes += 1;
+					return replaced;
+				}
 				docs.push(doc);
 				const text = asText(bytes);
 				if (text === null) replaced[key] = handleLine(doc);
@@ -226,7 +242,8 @@ function parseJsonText(text) {
  *  erhalten, binaere Ressourcen und base64-Felder werden durch die Zeile [FILE ...] ersetzt. */
 async function capture(result, { user, conversationId, server, tool }) {
 	if (!result || !user || !conversationId || typeof conversationId !== "string") return result;
-	const ctx = { user: String(user), conversationId, source: `${tool}_mcp_${server}`, tool };
+	/** notes: Dateien, die wegen der Speichergrenze nicht gespeichert wurden; ihr Hinweis ersetzt die Bytes. */
+	const ctx = { user: String(user), conversationId, source: `${tool}_mcp_${server}`, tool, notes: 0 };
 	const docs = [];
 	const content = [];
 	let imageNumber = 0;
@@ -237,7 +254,13 @@ async function capture(result, { user, conversationId, server, tool }) {
 				imageNumber += 1;
 				if (bytes && bytes.length <= MAX_BYTES) {
 					const ext = MIME_EXT[mimeOf("", item.mimeType)] ?? "bin";
-					docs.push(await store({ ...ctx, bytes, name: item._meta?.filename ?? `${tool}-${imageNumber}.${ext}`, mime: item.mimeType }));
+					const name = item._meta?.filename ?? `${tool}-${imageNumber}.${ext}`;
+					try {
+						docs.push(await store({ ...ctx, bytes, name, mime: item.mimeType }));
+					} catch (error) {
+						content.push({ type: "text", text: quotaNote(name, error) });
+						ctx.notes += 1;
+					}
 				}
 				content.push(item);
 				continue;
@@ -246,9 +269,14 @@ async function capture(result, { user, conversationId, server, tool }) {
 				const bytes = decodeBase64(item.resource.blob);
 				const name = item.resource._meta?.filename ?? uriName(item.resource.uri) ?? `${tool}.bin`;
 				if (bytes && bytes.length <= MAX_BYTES) {
-					const doc = await store({ ...ctx, bytes, name, mime: item.resource.mimeType });
-					docs.push(doc);
-					content.push({ type: "text", text: handleLine(doc) });
+					try {
+						const doc = await store({ ...ctx, bytes, name, mime: item.resource.mimeType });
+						docs.push(doc);
+						content.push({ type: "text", text: handleLine(doc) });
+					} catch (error) {
+						content.push({ type: "text", text: quotaNote(name, error) });
+						ctx.notes += 1;
+					}
 				} else content.push({ type: "text", text: `[${name}: ${bytes ? sizeText(bytes.length) : "unreadable"}, not stored]` });
 				continue;
 			}
@@ -256,8 +284,9 @@ async function capture(result, { user, conversationId, server, tool }) {
 				const parsed = parseJsonText(item.text);
 				if (parsed !== void 0) {
 					const before = docs.length;
+					const notesBefore = ctx.notes;
 					const replaced = await captureJson(parsed, ctx, docs);
-					if (docs.length > before) {
+					if (docs.length > before || ctx.notes > notesBefore) {
 						content.push({ ...item, text: JSON.stringify(replaced, null, 2) });
 						continue;
 					}
@@ -277,9 +306,9 @@ async function capture(result, { user, conversationId, server, tool }) {
 		console.error("[bosToolFiles] capture failed", error);
 		return result;
 	}
-	if (docs.length === 0) return result;
+	if (docs.length === 0 && ctx.notes === 0) return result;
 	const lines = [...new Map(docs.map((doc) => [doc.id, doc])).values()].map(handleLine);
-	content.push({ type: "text", text: `Files stored by the system (pass {{file:ID}} unchanged in tool arguments, code or your answer; never type file contents):\n${lines.join("\n")}` });
+	if (lines.length > 0) content.push({ type: "text", text: `Files stored by the system (pass {{file:ID}} unchanged in tool arguments, code or your answer; never type file contents):\n${lines.join("\n")}` });
 	result.content = content;
 	return result;
 }
