@@ -14,6 +14,8 @@ const TTL_DAYS = 30;
 const MAX_BYTES = 50 * 1024 * 1024;
 const MAX_LIST = 10;
 const MAX_APPEND = 20;
+/** Text bis zu dieser Groesse bleibt zusaetzlich zur [FILE]-Zeile lesbar im Ergebnis (Quelltext, CSV, Logs). */
+const MAX_INLINE_TEXT = 100 * 1024;
 const APP_ROOT = "/app";
 const PUBLIC_ROOT = "/app/client/public";
 const FILE_REF = /\{\{file:([^{}\n]+?)\}\}/g;
@@ -23,6 +25,8 @@ const BASE64_KEYS = ["content_base64", "data_base64", "base64"];
 const EXT_MIME = {
 	png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
 	pdf: "application/pdf", txt: "text/plain", csv: "text/csv", json: "application/json", xml: "application/xml",
+	md: "text/markdown", html: "text/html", css: "text/css", js: "text/javascript", yaml: "application/yaml",
+	yml: "application/yaml", log: "text/plain", java: "text/x-java", py: "text/x-python", sh: "text/x-sh",
 	zip: "application/zip", mp4: "video/mp4", xls: "application/vnd.ms-excel", doc: "application/msword",
 	xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -127,6 +131,15 @@ async function store({ user, conversationId, bytes, name, mime, source }) {
 	return doc;
 }
 
+/** Bytes als Text, wenn sie gueltiges UTF-8 ohne NUL-Zeichen sind, sonst null. */
+function asText(bytes) {
+	if (bytes.length > MAX_INLINE_TEXT || bytes.includes(0)) return null;
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		return null;
+	}
+}
 function decodeBase64(text) {
 	if (typeof text !== "string" || text.length === 0) return null;
 	const clean = text.replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
@@ -177,7 +190,19 @@ async function captureJson(value, ctx, docs, depth = 0) {
 			else {
 				const doc = await store({ ...ctx, bytes, name: nameOf(value, `${ctx.tool}.bin`), mime: value.mime_type ?? value.mimeType ?? value.content_type ?? value.contentType });
 				docs.push(doc);
-				replaced[key] = handleLine(doc);
+				const text = asText(bytes);
+				if (text === null) replaced[key] = handleLine(doc);
+				else {
+					// Text bleibt lesbar; die Datei geht ueber die [FILE]-Zeile weiter
+					if (key === "content") replaced.content = text;
+					else {
+						delete replaced[key];
+						replaced.text = text;
+					}
+					for (const field of ["encoding", "content_format", "format"]) if (typeof replaced[field] === "string") replaced[field] = "text";
+					if (typeof replaced.content_type === "string") replaced.content_type = replaced.content_type.replace(/;\s*base64$/i, "");
+					replaced.file = handleLine(doc);
+				}
 			}
 			return replaced;
 		}
