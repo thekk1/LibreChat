@@ -384,25 +384,43 @@ async function expandArgs(args, scope) {
 	const replace = (text) => text.replace(REF_PATTERN, (ref) => formatForTool(found.get(ref).set, found.get(ref).wanted));
 	return { args: mapStrings(args, replace), unknown };
 }
-/** Auftrag an einen Subagenten: Verweise bleiben stehen, darunter je Menge ihre Zeile [DATA ...]. */
+/** Die juengsten Mengen der Chats, ohne ihre Zeilen zu laden. */
+async function recentSets({ user, conversationIds }, exclude) {
+	const ids = [...new Set((conversationIds ?? []).filter((id) => typeof id === "string" && id !== ""))];
+	if (!user || ids.length === 0) return [];
+	const col = collection();
+	await indexReady;
+	const docs = await col.aggregate([
+		{ $match: { user: String(user), conversationId: { $in: ids }, id: { $nin: [...exclude] } } },
+		{ $sort: { createdAt: -1 } },
+		{ $limit: MAX_HANDLES },
+		{ $project: { id: 1, source: 1, columns: 1, count: { $size: "$rows" }, first: { $arrayElemAt: ["$rows", 0] } } }
+	]).toArray();
+	return docs.map((doc) => ({ id: doc.id, source: doc.source, columns: doc.columns, rows: Object.assign(new Array(doc.count), { 0: doc.first ?? {} }), note: "" }));
+}
+/** Auftrag an einen Subagenten: Verweise bleiben stehen, darunter je Menge ihre Zeile [DATA ...].
+ *  Dazu die uebrigen juengsten Mengen des Chats: Vergisst der Hauptagent den Verweis ("diese 49 Schluessel"),
+ *  findet der Subagent die Menge trotzdem. */
 async function describeRefs(text, scope) {
 	const { found, unknown } = await lookupRefs([text], scope);
-	if (unknown.length > 0 || found.size === 0) return { text, unknown };
+	if (unknown.length > 0) return { text, unknown };
 	const sets = [...new Map([...found.values()].map(({ set }) => [set.id, set])).values()];
-	const lines = sets.map((set) => handleLine({ ...set, note: "" }));
-	return {
-		text: `${text}\n\nData references in this request: the system inserts the rows when a tool runs; pass each {{data:...}} unchanged in tool arguments or code, never type its rows.\n${lines.join("\n")}`,
-		unknown
-	};
+	const others = await recentSets(scope, new Set(sets.map((set) => set.id)));
+	const blocks = [];
+	if (sets.length > 0) blocks.push(`Data references in this request: the system inserts the rows when a tool runs; pass each {{data:...}} unchanged in tool arguments or code, never type its rows.\n${sets.map((set) => handleLine({ ...set, note: "" })).join("\n")}`);
+	if (others.length > 0) blocks.push(`Other data sets of this chat, newest first. If the request refers to items it does not list (for example "these keys" or "the tickets above"), take them from the matching set: write {{data:ID:column}} unchanged in tool arguments or code, never type its rows.\n${others.map(handleLine).join("\n")}`);
+	return { text: blocks.length === 0 ? text : `${text}\n\n${blocks.join("\n\n")}`, unknown };
 }
-const PARTIAL_REF = /\{(?:\{(?:d(?:a(?:t(?:a(?::[^{}\n]{0,200}\}?)?)?)?)?)?)?$/;
+/** Angefangener Verweis {{data:...}} oder {{file:...}} am Ende eines Textstuecks. */
+const PARTIAL_REF = /\{(?:\{(?:(?:d(?:a(?:t(?:a)?)?)?|f(?:i(?:l(?:e)?)?)?)(?::[^{}\n]{0,200}\}?)?)?)?$/;
 const ARTIFACT_ROWS = 100;
 const ARTIFACT_MARK = /:::artifact\{|(?:^|\n):::[ \t]*(?=\n|$)/g;
 const TABLE_TAIL = /(^|\n)\|[^\n]*(?:\n(?:\|[ :|-]*\n?)?)?$/;
 const MODEL_HEADER_TABLE = /(\|[^\n]*\|[ \t]*\n\|[ :|-]+\|[ \t]*\n)\|[^\n]*\|\n\|(?:---\|)+\n/g;
 const MODEL_HEADER_ARTIFACT = /(\|[^\n]*\|[ \t]*\n\|[ :|-]+\|[ \t]*\n)\n*(:::artifact\{[^\n]*\n````\n)\|[^\n]*\|\n\|(?:---\|)+\n/g;
 /** Antworttext des Hauptagenten. Ein Verweis kann ueber mehrere Textstuecke verteilt ankommen. */
-function createAnswerFilter() {
+/** renderFiles: setzt {{file:...}} ein (bosToolFiles, Anhang der Antwort); fehlt es, bleibt der Verweis stehen. */
+function createAnswerFilter({ renderFiles } = {}) {
 	const buffers = /* @__PURE__ */ new Map();
 	const tails = /* @__PURE__ */ new Map();
 	const insideArtifact = /* @__PURE__ */ new Map();
@@ -434,6 +452,7 @@ function createAnswerFilter() {
 		let output = result.text;
 		for (const problem of result.unknown) output = output.replace(new RegExp(`\\{\\{data:${problem.slice(0, 8)}[^{}\\n]*\\}\\}`, "g"), `[Daten ${problem.slice(0, 8)} nicht verfuegbar]`);
 		if (text.includes("{{data:")) output = mergeHeaders(output);
+		if (renderFiles && output.includes("{{file:")) output = await renderFiles(output, metadata, graph);
 		track(id, text);
 		return output;
 	};
