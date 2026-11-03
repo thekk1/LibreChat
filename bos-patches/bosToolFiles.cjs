@@ -91,7 +91,8 @@ async function store({ user, conversationId, bytes, name, mime, source }) {
 	const fileName = safeName(name);
 	const type = mimeOf(fileName, mime);
 	const file_id = crypto.randomUUID();
-	const dir = type.startsWith("image/") ? "images" : "uploads";
+	/** Bilder und Videos unter /images: der Browser laedt sie dort mit dem Anmelde-Cookie, Videos auch abschnittsweise. */
+	const dir = /^(image|video)\//.test(type) ? "images" : "uploads";
 	const filepath = `/${dir}/${user}/${file_id}__${fileName}`;
 	const target = diskPath(filepath);
 	await fs.promises.mkdir(path.dirname(target), { recursive: true });
@@ -443,11 +444,11 @@ async function collect({ content, messages, user, conversationId, parentToolCall
 	return missing.length === 0 ? content : `${content}\n\n${missing.join("\n")}`;
 }
 
-/** Bild unter /images/ (statisch ausgeliefert, mit dem Anmelde-Cookie): Markdown-Bild, das der Client im
- *  Text anzeigt. Sonst null. */
+/** Bild oder Video unter /images/ (statisch ausgeliefert, mit dem Anmelde-Cookie): Markdown-Bild, das der
+ *  Client im Text anzeigt, ein Video als Spieler (Patch client-bundle). Sonst null. */
 function inlineImage(doc) {
 	const filepath = String(doc.filepath ?? "");
-	if (!String(doc.mime ?? "").startsWith("image/") || !filepath.startsWith("/images/")) return null;
+	if (!/^(image|video)\//.test(String(doc.mime ?? "")) || !filepath.startsWith("/images/")) return null;
 	const url = encodeURI(filepath).replace(/\(/g, "%28").replace(/\)/g, "%29");
 	const alt = String(doc.name ?? "").replace(/[\[\]\\]/g, "");
 	return `![${alt}](${url})`;
