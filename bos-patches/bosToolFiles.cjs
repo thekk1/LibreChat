@@ -443,7 +443,27 @@ async function collect({ content, messages, user, conversationId, parentToolCall
 	return missing.length === 0 ? content : `${content}\n\n${missing.join("\n")}`;
 }
 
-/** Antworttext: Verweis wird zum Dateinamen, die Datei zum Anhang der Antwort (attach). */
+/** Bild unter /images/ (statisch ausgeliefert, mit dem Anmelde-Cookie): Markdown-Bild, das der Client im
+ *  Text anzeigt. Sonst null. */
+function inlineImage(doc) {
+	const filepath = String(doc.filepath ?? "");
+	if (!String(doc.mime ?? "").startsWith("image/") || !filepath.startsWith("/images/")) return null;
+	const url = encodeURI(filepath).replace(/\(/g, "%28").replace(/\)/g, "%29");
+	const alt = String(doc.name ?? "").replace(/[\[\]\\]/g, "");
+	return `![${alt}](${url})`;
+}
+/** Andere Datei mit file_id: Markdown-Link der Form files/<Benutzer>/<file_id>/<Name>. Der Client erkennt ihn
+ *  (MarkdownAnchor) und laedt die Datei ueber /api/files/download/<Benutzer>/<file_id>; der letzte Teil ist
+ *  der Name beim Speichern, ohne Leer- und Klammerzeichen, weil der Client nur bis zum ersten Leerzeichen liest. */
+function downloadLink(doc) {
+	if (!doc.file_id || !doc.user) return null;
+	const name = String(doc.name ?? "datei");
+	const urlName = encodeURIComponent(name.replace(/[\s()[\]<>]+/g, "_"));
+	const text = name.replace(/[\[\]\\]/g, "");
+	return `[${text}](/api/files/${encodeURIComponent(String(doc.user))}/${encodeURIComponent(doc.file_id)}/${urlName})`;
+}
+/** Antworttext: Bilder erscheinen als Markdown-Bild im Text, andere Dateien als Download-Link; nur ohne beides
+ *  wird der Verweis zum Dateinamen und die Datei zum Anhang der Antwort (attach). */
 async function renderAnswer(text, scope, attach) {
 	if (!text.includes("{{file:")) return text;
 	const { found } = await lookupAll([text], scope);
@@ -457,6 +477,8 @@ async function renderAnswer(text, scope, attach) {
 			if (field === "name") replacement = doc.name;
 			else if (field === "mime") replacement = doc.mime;
 			else if (field === "size") replacement = sizeText(doc.size);
+			else if (inlineImage(doc)) replacement = inlineImage(doc);
+			else if (downloadLink(doc)) replacement = downloadLink(doc);
 			else {
 				replacement = `„${doc.name}“`;
 				await attach(doc).catch((error) => console.error("[bosToolFiles] attach failed", error));
