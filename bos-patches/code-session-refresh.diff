@@ -1,0 +1,92 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -99684,7 +99684,14 @@
+ 			}
+ 			tc.args = args;
+ 			if (codeFiles.length > 0) {
+-				const merged = mergeCodeFilesIntoContext(tc.codeSessionContext, codeFiles);
++				/** Die eben hochgeladene Fassung ersetzt eine gleichnamige Datei der Sitzung: diese stammt vom Beginn
++				*  des Laufs, und mergeCodeFilesIntoContext behielte sonst sie und verwuerfe die neue. */
++				const names = new Set(codeFiles.map((file) => file.name));
++				const prior = tc.codeSessionContext == null ? void 0 : {
++					...tc.codeSessionContext,
++					files: (tc.codeSessionContext.files ?? []).filter((file) => !names.has(file.name))
++				};
++				const merged = mergeCodeFilesIntoContext(prior, codeFiles);
+ 				if (merged) tc.codeSessionContext = merged;
+ 			}
+ 		} catch (error) {
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -38,8 +38,42 @@
+ const SUBAGENT_RESOLUTION_ERROR_MESSAGE = "Subagent error: Unable to initialize the selected subagent.";
+ const SUBAGENT_CONFIG_CHANGED_MESSAGE = "Subagent error: Subagent configuration changed since this execution was paused.";
+ const SUBAGENT_INVOCATION_CHANGED_MESSAGE = "Subagent error: Subagent invocation changed for this execution.";
+-function seedChildGraphSessions(childGraph, agents) {
++function seedChildGraphSessions(childGraph, agents, parentCodeSession) {
+ 	require_toolSessions.seedAgentInitialSessions(childGraph.sessions, agents);
++	bosRefreshChildCodeFiles(childGraph.sessions, agents, parentCodeSession?.());
++}
++/** BOS: Die Startdateien eines Subagenten stammen vom Beginn des Laufs. Hat der aufrufende Agent eine Datei seither
++*  geaendert (edit_file, Codeausfuehrung), steht in seiner Code-Sitzung eine neuere Fassung unter demselben Namen;
++*  die bekommt der Subagent unter /mnt/data statt der alten. */
++function bosRefreshChildCodeFiles(sessions, agents, parent) {
++	if (!Array.isArray(parent?.files) || parent.files.length === 0) return;
++	const latest = /* @__PURE__ */ new Map();
++	for (const file of parent.files) if (file?.name && file.id) latest.set(file.name, {
++		...file,
++		storage_session_id: file.storage_session_id ?? parent.session_id
++	});
++	const keys = new Set(agents.map((agent) => agent.codeSessionKey ?? "execute_code"));
++	for (const key of keys) {
++		const context = sessions.get(key);
++		if (!Array.isArray(context?.files)) continue;
++		let changed = false;
++		const files = context.files.map((file) => {
++			const newer = latest.get(file?.name);
++			if (newer == null || newer.id === file.id && newer.storage_session_id === file.storage_session_id) return file;
++			changed = true;
++			return {
++				...file,
++				id: newer.id,
++				storage_session_id: newer.storage_session_id,
++				...newer.resource_id != null ? { resource_id: newer.resource_id } : {},
++				...newer.kind != null ? { kind: newer.kind } : {}
++			};
++		});
++		if (changed) sessions.set(key, {
++			...context,
++			files
++		});
++	}
+ }
+ async function awaitWithAbort(promise, signal) {
+ 	signal.throwIfAborted();
+@@ -314,6 +348,7 @@
+ 		this.hookRegistry = options.hookRegistry;
+ 		this.parentRunId = options.parentRunId;
+ 		this.parentAgentId = options.parentAgentId;
++		this.bosParentCodeSession = options.bosParentCodeSession;
+ 		this.executionContext = options.executionContext ?? {
+ 			rootRunId: options.parentRunId,
+ 			hookSessionId: options.parentRunId,
+@@ -1167,7 +1202,7 @@
+ 			};
+ 		}
+ 		if (params.taskRuntime != null) childGraph.hookRegistry = this.hookRegistry;
+-		seedChildGraphSessions(childGraph, childPlan.agents);
++		seedChildGraphSessions(childGraph, childPlan.agents, this.bosParentCodeSession);
+ 		let forwarding;
+ 		if (forwardingEnabled) forwarding = this.createForwarderCallback({
+ 			parentRegistry,
+--- a/node_modules/@librechat/agents/dist/cjs/graphs/Graph.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/graphs/Graph.cjs
+@@ -2229,6 +2229,8 @@
+ 					parentHandlerRegistry: getParentHandlerRegistry,
+ 					parentRunId: this.runId ?? "",
+ 					parentAgentId: agentContext.agentId,
++					/** BOS: aktuelle Code-Sitzung des aufrufenden Agenten, siehe bosRefreshChildCodeFiles in SubagentExecutor.cjs */
++					bosParentCodeSession: () => this.sessions.get(agentContext.codeSessionKey ?? "execute_code"),
+ 					executionContext: this.subagentExecutionContext,
+ 					langfuse: this.langfuse,
+ 					tokenCounter: agentContext.tokenCounter,

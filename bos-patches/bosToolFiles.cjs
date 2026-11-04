@@ -207,7 +207,10 @@ async function captureJson(value, ctx, docs, depth = 0) {
 					return replaced;
 				}
 				docs.push(doc);
-				const text = asText(bytes);
+				/** as_file: true verlangt nur die [FILE]-Zeile, auch fuer Text (Kopie in den Chat fuer die Codeausfuehrung). */
+				const asFile = value.as_file === true;
+				delete replaced.as_file;
+				const text = asFile ? null : asText(bytes);
 				if (text === null) replaced[key] = handleLine(doc);
 				else {
 					// Text bleibt lesbar; die Datei geht ueber die [FILE]-Zeile weiter
