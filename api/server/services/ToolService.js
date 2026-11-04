@@ -123,8 +123,15 @@ const { createOpenIDSessionTokenProvider } = require('~/server/services/OpenIDSe
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
-const { findPluginAuthsByKeys, getRoleByName } = require('~/models');
-const { getFlowStateManager, getMCPServersRegistry } = require('~/config');
+const {
+  findToken,
+  createToken,
+  updateToken,
+  deleteTokens,
+  findPluginAuthsByKeys,
+  getRoleByName,
+} = require('~/models');
+const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
 
 const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
@@ -781,6 +788,49 @@ const isBuiltInTool = (toolName) =>
 function noteSubagentNotStarted(req, agentId, result) {
   req.bosSubagentNotStarted ??= new Map();
   req.bosSubagentNotStarted.set(agentId, result);
+}
+
+/** BOS patch (mcp-precheck): a cheap read-only call per server, made before a subagent starts. */
+const MCP_PRECHECKS = {
+  trac: { tool: 'get_server_time' },
+  gitea: { tool: 'get_me' },
+  jenkins: { tool: 'get_all_views' },
+  portainer: { tool: 'systemInfo' },
+  nextcloud: { tool: 'nc_auth_check_status' },
+  exchange: { tool: 'list_folders', args: () => ({ depth: 1 }) },
+  'jira-mercedes': {
+    tool: 'jira_get_user_profile',
+    args: (vars) => ({ user_identifier: vars?.ATLASSIAN_EMAIL }),
+  },
+};
+const MCP_PRECHECK_TIMEOUT_MS = 15000;
+const MCP_PRECHECK_PASSED_MS = 300000;
+const mcpPrecheckPassed = new Map();
+
+/** The text of a tool result, whatever content format the provider gets. */
+function mcpResultText(result) {
+  const content = Array.isArray(result) ? result[0] : result;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part === 'string' ? part : part?.text ?? '')).join('');
+  }
+  return JSON.stringify(content ?? '');
+}
+
+/** Blocks only on a clear sign-in failure; anything else (timeout, 403, no answer) lets the subagent run. */
+function mcpPrecheckVerdict(serverName, text) {
+  if (serverName === 'nextcloud') {
+    const status = /"status"\s*:\s*"([a-z_]+)"/.exec(text)?.[1];
+    if (status === 'not_initiated' || status === 'pending' || status === 'login_required') {
+      return 'login';
+    }
+  }
+  const head = text.slice(0, 400);
+  const failed = /^\W*(error|failed)|"error"\s*:|\berr:/i.test(head);
+  const rejected = /auth_failed|\b401\b|unauthori[sz]ed|authentication failed|invalid credentials/i.test(head);
+  return failed && rejected ? 'rejected' : 'ok';
 }
 
 /** BOS patch (subagent-oauth): subagents start at the same time and read the same content length.
@@ -1550,6 +1600,88 @@ async function loadToolDefinitionsWrapper({
       agent.id,
       `The subagent did not start: the user has not stored the credentials it needs. Tell the user and give them this link unchanged: ${links.join(', ')}. After saving they can ask again. Do not start this subagent again in this turn.`,
     );
+  }
+
+  /** BOS patch (mcp-precheck): a subagent whose server rejects the stored sign-in, or wants a second
+   *  login like Nextcloud, only finds out after model calls. Ask the server before the model runs. */
+  if (skipMCPOAuthWait && !req.bosSubagentNotStarted?.has(agent.id)) {
+    const precheckServers = getMCPServerNamesFromTools(defsFilteredTools, mcpServerNames);
+    for (const serverName of precheckServers) {
+      const precheck = MCP_PRECHECKS[serverName];
+      const passedKey = `${req.user.id}:${serverName}`;
+      if (!precheck || (mcpPrecheckPassed.get(passedKey) ?? 0) > Date.now()) {
+        continue;
+      }
+      const vars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+      const callPrecheckTool = async (toolName, toolArguments) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), MCP_PRECHECK_TIMEOUT_MS);
+        try {
+          const result = await getMCPManager().callTool({
+            serverName,
+            serverConfig:
+              configServers?.[serverName] ??
+              (await getMCPServersRegistry().getServerConfig(serverName, req.user.id, configServers)),
+            toolName,
+            provider: agent.provider,
+            toolArguments,
+            options: { signal: controller.signal },
+            user: req.user,
+            requestBody: runtimeRequestBody,
+            customUserVars: vars,
+            flowManager,
+            tokenMethods: { findToken, createToken, updateToken, deleteTokens },
+            upstreamTokenProvider,
+            upstreamTokenProviderResolver,
+            oboIdentityContext,
+          });
+          return mcpResultText(result);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      try {
+        let answered = true;
+        const text = await callPrecheckTool(precheck.tool, precheck.args?.(vars) ?? {}).catch((error) => {
+          answered = false;
+          return `Error: ${error?.message ?? ''}`;
+        });
+        const verdict = mcpPrecheckVerdict(serverName, text);
+        logger.info(`[Tool Definitions] MCP precheck ${serverName}: ${verdict}${answered ? '' : ' (no answer)'}`);
+        if (verdict === 'ok') {
+          if (answered) {
+            mcpPrecheckPassed.set(passedKey, Date.now() + MCP_PRECHECK_PASSED_MS);
+          }
+          continue;
+        }
+        if (verdict === 'login') {
+          const provision = await callPrecheckTool('nc_auth_provision_access', {});
+          const loginUrl = /"login_url"\s*:\s*"(https?:[^"\s]+)"/.exec(provision)?.[1];
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            loginUrl
+              ? `The subagent did not start: the user has not logged in to Nextcloud yet. Tell the user and give them this link unchanged: [In Nextcloud anmelden](${loginUrl}). After logging in they can ask again. Do not start this subagent again in this turn.`
+              : 'The subagent did not start: the login to Nextcloud is not finished. Tell the user to finish it in the browser and to ask again. Do not start this subagent again in this turn.',
+          );
+        } else if (vars) {
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            `The subagent did not start: the server ${serverName} rejected the stored credentials. Tell the user and give them this link unchanged: [Zugangsdaten für ${serverName} korrigieren](${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)}). After saving they can ask again. Do not start this subagent again in this turn.`,
+          );
+        } else {
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            `The subagent did not start: the server ${serverName} rejected the sign-in. Tell the user to disconnect and connect ${serverName} again in the side panel "MCP servers" and to ask again. Do not start this subagent again in this turn.`,
+          );
+        }
+        break;
+      } catch (error) {
+        logger.info(`[Tool Definitions] MCP precheck ${serverName}: no answer, subagent starts`);
+      }
+    }
   }
 
   if (hasExpectedMCPTools && mcpResolution?.resolvedToolCount === 0) {
