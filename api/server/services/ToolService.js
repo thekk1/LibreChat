@@ -823,7 +823,7 @@ function mcpResultText(result) {
 function mcpPrecheckVerdict(serverName, text) {
   if (serverName === 'nextcloud') {
     const status = /"status"\s*:\s*"([a-z_]+)"/.exec(text)?.[1];
-    if (status === 'not_initiated' || status === 'pending' || status === 'login_required') {
+    if (status === 'not_initiated' || status === 'revoked' || status === 'pending' || status === 'login_required') {
       return 'login';
     }
   }
