@@ -56,12 +56,16 @@ function parseJson(text) {
 	return void 0;
 }
 const isScalar = (value) => value === null || typeof value !== "object";
+/** Zahlen, Wahrheitswerte und null bleiben, was sie sind: Code und Werkzeuge bekommen die Zeilen als JSON,
+ *  und "false" als Text ist dort wahr. Nur Text wird gekuerzt. */
 function cell(value) {
-	if (value === null || value === void 0) return "";
-	if (Array.isArray(value) && value.every(isScalar)) return value.join(", ");
+	if (value === null || value === void 0) return null;
+	if (typeof value === "number" || typeof value === "boolean") return value;
+	if (Array.isArray(value) && value.every(isScalar)) value = value.join(", ");
 	const text = typeof value === "object" ? JSON.stringify(value) : String(value);
 	return text.length > MAX_CELL ? `${text.slice(0, MAX_CELL)}...` : text;
 }
+const isEmpty = (value) => value === "" || value === null || value === void 0;
 function flattenRow(item) {
 	if (isScalar(item)) return { value: cell(item) };
 	if (Array.isArray(item)) return { value: cell(item) };
@@ -74,7 +78,7 @@ function flattenRow(item) {
 }
 function columnsOf(rows) {
 	const columns = [];
-	for (const row of rows.slice(0, 50)) for (const name of Object.keys(row)) if (!columns.includes(name) && rows.some((other) => other[name] !== "" && other[name] !== void 0)) columns.push(name);
+	for (const row of rows.slice(0, 50)) for (const name of Object.keys(row)) if (!columns.includes(name) && rows.some((other) => !isEmpty(other[name]))) columns.push(name);
 	return columns.slice(0, MAX_COLUMNS);
 }
 /** Findet ohne Feldnamen: Listen, Zuordnungen Schluessel -> Objekt, Listen in verschachtelten Objekten. */
@@ -210,7 +214,7 @@ function handleLine(set) {
 function identifyingValues(set) {
 	const values = /* @__PURE__ */ new Set();
 	for (const name of set.columns) {
-		const column = set.rows.map((row) => row[name]).filter((value) => typeof value === "string" && value.length >= 3);
+		const column = set.rows.map((row) => typeof row[name] === "number" ? String(row[name]) : row[name]).filter((value) => typeof value === "string" && value.length >= 3);
 		if (column.length < set.rows.length * .9 || new Set(column).size < column.length * .9) continue;
 		for (const value of column) if (!/\s/.test(value)) values.add(value);
 	}
@@ -360,7 +364,7 @@ function formatForTool(set, wanted) {
 		const values = set.rows.map((row) => String(row[columns[0]] ?? ""));
 		return values.some((value) => /[,;\r\n]/.test(value)) ? JSON.stringify(values) : values.join(", ");
 	}
-	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? ""]))));
+	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? null]))));
 }
 function stringsOf(value, out = []) {
 	if (typeof value === "string") out.push(value);
