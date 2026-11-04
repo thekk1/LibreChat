@@ -4,6 +4,9 @@
 //   (v0.8.8 uebergeht dort interface.*.openNewTab).
 // - hooks (MarkdownImage): ![Name](/images/....mp4) als Videospieler statt <img>, fuer Videos, die
 //   tool-files in die Antwort setzt.
+// - index (BadgeRow): ein Klick auf einen Link zu /mcp-zugang/ oeffnet den Zugangsdaten-Dialog von LibreChat
+//   (MCPConfigDialog) im Chat statt des Formulars in einem neuen Tab. Das Menue mit diesem Dialog fehlt bei
+//   Presets mit Agent (MCPSelect nur mit showEphemeralBadges), deshalb eine eigene Komponente neben dem Menue.
 // sw.js gibt jedem geaenderten Chunk eine Revision, sonst liefert der Service Worker den alten aus.
 // Aufruf: docker run --rm -v "$PWD/patches/client-bundle:/out" --entrypoint node \
 //           ghcr.io/librechat-ai/librechat:v0.8.8 /out/mkpatch.js /out
@@ -11,7 +14,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-2';
+const REVISION = 'bos-3';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -25,7 +28,18 @@ const write = (name, text, compressed = true) => {
   fs.writeFileSync(`${out}/${name}.br`, zlib.brotliCompressSync(text));
 };
 
+const MCP_DIALOG = 'function bosMcpDialog(){let{conversationId:e,storageContextKey:t,mcpServerManager:n}=ud()??{},'
+  + 'r=(0,Q.useRef)(n);r.current=n,(0,Q.useEffect)(()=>{let e=e=>{if(e.button!==0||e.ctrlKey||e.metaKey||e.shiftKey)return;'
+  + 'let t=e.target?.closest?.(`a[href*="/mcp-zugang/index.html?server="]`);if(!t)return;'
+  + 'let n=r.current?.getServerStatusIconProps?.(new URL(t.href).searchParams.get(`server`));n?.onConfigClick&&n.onConfigClick(e)};'
+  + 'return document.addEventListener(`click`,e,!0),()=>document.removeEventListener(`click`,e,!0)},[]);'
+  + 'let i=n?.getConfigDialogProps();return i?(0,$.jsx)(RD,{...i,conversationId:e,storageContextKey:t}):null}';
+
 const chunks = {
+  'index.CSEwt3Fy.js': (js) => swap(swap(js,
+    'function eO(){let{selectableServers:e}=ud()?.mcpServerManager', `${MCP_DIALOG}function eO(){let{selectableServers:e}=ud()?.mcpServerManager`),
+    'className:`relative flex flex-wrap items-center gap-2`,children:[e===!0&&(0,$.jsx)(HD,{}),',
+    'className:`relative flex flex-wrap items-center gap-2`,children:[(0,$.jsx)(bosMcpDialog,{}),e===!0&&(0,$.jsx)(HD,{}),'),
   'MyFilesModal.D-V6_fYt.js': (js) => swap(js,
     'getPaginationRowModel:x(),onRowSelectionChange:l,',
     'getPaginationRowModel:x(),initialState:{pagination:{pageIndex:0,pageSize:100}},onRowSelectionChange:l,'),
