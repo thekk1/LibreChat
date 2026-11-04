@@ -7,7 +7,8 @@
 // - index (BadgeRow): ein Klick auf einen Link zu /mcp-zugang/ oeffnet den Zugangsdaten-Dialog von LibreChat
 //   (MCPConfigDialog) im Chat statt des Formulars in einem neuen Tab. Das Menue mit diesem Dialog fehlt bei
 //   Presets mit Agent (MCPSelect nur mit showEphemeralBadges), deshalb eine eigene Komponente neben dem Menue.
-//   Dieselbe Komponente zeigt diese Links und den Login-Flow-Link von Nextcloud als Knopf.
+//   Dieselbe Komponente zeigt diese Links und den Login-Flow-Link von Nextcloud als Knopf und laesst im
+//   Preset-Menue Zeilenumbrueche der Beschreibung (SpecDescription) gelten.
 // sw.js gibt jedem geaenderten Chunk eine Revision, sonst liefert der Service Worker den alten aus.
 // Aufruf: docker run --rm -v "$PWD/patches/client-bundle:/out" --entrypoint node \
 //           ghcr.io/librechat-ai/librechat:v0.8.8 /out/mkpatch.js /out
@@ -15,7 +16,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-4';
+const REVISION = 'bos-6';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -34,7 +35,8 @@ const MCP_BUTTON_CSS = `${MCP_BUTTON_LINKS}{display:inline-block;margin:.25rem 0
   + 'background-color:#047857;background-color:rgb(var(--surface-submit));color:#fff!important;font-weight:500;'
   + 'text-decoration:none!important;cursor:pointer}'
   + MCP_BUTTON_LINKS.split(',').map((link) => `${link}:hover`).join(',')
-  + '{background-color:#065f46;background-color:rgb(var(--surface-submit-hover))}';
+  + '{background-color:#065f46;background-color:rgb(var(--surface-submit-hover))}'
+  + '[role="option"] .break-words.text-xs.font-normal,[role="menuitem"] .break-words.text-xs.font-normal{white-space:pre-line}';
 const MCP_DIALOG = 'function bosMcpDialog(){let{conversationId:e,storageContextKey:t,mcpServerManager:n}=ud()??{},'
   + 'r=(0,Q.useRef)(n);r.current=n,(0,Q.useEffect)(()=>{let e=e=>{if(e.button!==0||e.ctrlKey||e.metaKey||e.shiftKey)return;'
   + 'let t=e.target?.closest?.(`a[href*="/mcp-zugang/index.html?server="]`);if(!t)return;'
