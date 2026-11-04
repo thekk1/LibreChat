@@ -1,0 +1,138 @@
+--- a/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
+@@ -42,9 +42,31 @@
+ 	description: SubagentToolDescription,
+ 	parameters: SubagentToolSchema
+ };
++/** BOS: Kurznamen statt Agenten-IDs. Das Modell schrieb IDs wie agent_bqFVwJV0dwKDSyqMnrIIC falsch ab
++ *  oder erfand welche; einen Namen wie "exchange" trifft es. Der Name kommt aus dem Agentennamen, bei
++ *  Gleichstand mit -2, -3, ...; der SubagentExecutor uebersetzt ihn zurueck in die ID. */
++function bosSubagentAliases(configs) {
++	const toType = /* @__PURE__ */ new Map();
++	const toAlias = /* @__PURE__ */ new Map();
++	const taken = new Set(configs.filter((c) => !String(c.type).startsWith("agent_")).map((c) => String(c.type)));
++	for (const c of configs) {
++		const type = String(c.type);
++		if (!type.startsWith("agent_")) continue;
++		const base = String(c.name ?? "").replace(/ß/g, "ss").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
++		let alias = base;
++		for (let n = 2; taken.has(alias); n++) alias = `${base}-${n}`;
++		taken.add(alias);
++		toType.set(alias, type);
++		toAlias.set(type, alias);
++	}
++	return { toType, toAlias };
++}
+ function buildSubagentToolParams(configs, options = {}) {
+-	const types = configs.map((c) => c.type);
+-	const typeDescriptions = configs.map((c) => `- "${c.type}" (${c.name}): ${c.description}`).join("\n");
++	const { toAlias } = bosSubagentAliases(configs);
++	const types = configs.map((c) => toAlias.get(String(c.type)) ?? c.type);
++	const typeDescriptions = configs.map((c) => `- "${toAlias.get(String(c.type)) ?? c.type}" (${c.name}): ${c.description}`).join("\n");
++	/** IDs bleiben gueltig: aeltere Aufrufe im Verlauf nennen sie. Angeboten werden nur die Kurznamen. */
++	const accepted = [...types, ...configs.map((c) => c.type).filter((type) => !types.includes(type))];
+ 	return {
+ 		name: SubagentToolName,
+ 		schema: {
+@@ -57,7 +79,7 @@
+ 				},
+ 				subagent_type: {
+ 					type: "string",
+-					enum: types,
++					enum: accepted,
+ 					description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(", ")}.`
+ 				},
+ 				...options.background === true ? { run_in_background: {
+@@ -87,6 +109,7 @@
+ exports.SubagentToolDescription = SubagentToolDescription;
+ exports.SubagentToolName = SubagentToolName;
+ exports.SubagentToolSchema = SubagentToolSchema;
++exports.bosSubagentAliases = bosSubagentAliases;
+ exports.buildSubagentToolParams = buildSubagentToolParams;
+ exports.createSubagentToolDefinition = createSubagentToolDefinition;
+ 
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -3,6 +3,7 @@
+ const require_misc = require("../../utils/misc.cjs");
+ const require_runStepResume = require("../runStepResume.cjs");
+ const require_SubagentReplay = require("./SubagentReplay.cjs");
++const require_SubagentTool = require("../SubagentTool.cjs");
+ const require_hitl = require("../../types/hitl.cjs");
+ const require_types = require("../../hooks/types.cjs");
+ const require_eagerEventExecution = require("../eagerEventExecution.cjs");
+@@ -306,6 +307,8 @@
+ 	resolveParentHandlerRegistry;
+ 	constructor(options) {
+ 		this.configs = options.configs;
++		/** BOS: Kurznamen aus SubagentTool.cjs zurueck in die Agenten-ID; alles danach sieht nur IDs. */
++		this.bosAliases = require_SubagentTool.bosSubagentAliases([...this.configs.values()]).toType;
+ 		this.parentSignal = options.parentSignal;
+ 		this.breakerScope = options.breakerScope;
+ 		this.hookRegistry = options.hookRegistry;
+@@ -347,7 +350,14 @@
+ 	getParentHandlerRegistry() {
+ 		return this.resolveParentHandlerRegistry?.();
+ 	}
++	bosType(type) {
++		return type == null ? type : this.bosAliases.get(type) ?? type;
++	}
+ 	executeInBackground(params) {
++		params = {
++			...params,
++			subagentType: this.bosType(params.subagentType)
++		};
+ 		if (this.taskConfig == null) return JSON.stringify({
+ 			status: "rejected",
+ 			message: "Background subagent execution is not enabled for this run."
+@@ -847,7 +857,7 @@
+ 		const inProcessSettledOutput = execution.settledOutput;
+ 		if (inProcessSettledOutput != null) {
+ 			const persistedSubagentType = getSubagentTypeFromArgs(inProcessSettledOutput.resolvedArgs);
+-			const subagentType = persistedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call);
++			const subagentType = this.bosType(persistedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call));
+ 			if (!isResumeExecutionCompatible(resumeExecution, subagentType, subagentType == null ? void 0 : this.configs.get(subagentType), persistedSubagentType != null)) return;
+ 			return deserializeToolOutput(inProcessSettledOutput);
+ 		}
+@@ -856,7 +866,7 @@
+ 		let marker = resumeCheckpoint?.marker;
+ 		let messages = resumeCheckpoint?.messages ?? [];
+ 		let persistedSubagentType = getSubagentTypeFromArgs(marker?.settledOutput?.resolvedArgs);
+-		let subagentType = persistedSubagentType ?? resumeExecution?.subagentType ?? getSubagentType(call);
++		let subagentType = this.bosType(persistedSubagentType ?? resumeExecution?.subagentType ?? getSubagentType(call));
+ 		let executableConfig = subagentType == null ? void 0 : this.configs.get(subagentType);
+ 		if (!isResumeExecutionCompatible(resumeExecution, subagentType, executableConfig, persistedSubagentType != null)) {
+ 			this.executions.remove(execution);
+@@ -868,7 +878,7 @@
+ 			marker = getSubagentCheckpointMarker(messages, parentToolCallId);
+ 			persistedSubagentType = getSubagentTypeFromArgs(marker?.settledOutput?.resolvedArgs);
+ 			if (persistedSubagentType != null) {
+-				subagentType = persistedSubagentType;
++				subagentType = this.bosType(persistedSubagentType);
+ 				executableConfig = this.configs.get(subagentType);
+ 			}
+ 			if (!isResumeExecutionCompatible(resumeExecution, subagentType, executableConfig, persistedSubagentType != null)) {
+@@ -905,7 +915,7 @@
+ 		const boundInvocation = execution.invocation;
+ 		if (boundInvocation != null && resolvedDescription != null && resolvedDescription !== boundInvocation.description) return;
+ 		const description = boundInvocation?.description ?? resolvedDescription ?? getSubagentDescriptionFromArgs(call.args) ?? "No task description provided";
+-		const subagentType = resolvedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call);
++		const subagentType = this.bosType(resolvedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call));
+ 		const executableConfig = subagentType == null ? void 0 : this.configs.get(subagentType);
+ 		const configId = resolvedSubagentType == null ? execution.binding?.configId ?? executableConfig?.configId ?? resumeExecution?.configId : executableConfig?.configId;
+ 		if (subagentType == null) return;
+@@ -961,9 +971,13 @@
+ 		})] }, activeChildRun.checkpointNodeId);
+ 	}
+ 	execute(params) {
++		params = {
++			...params,
++			subagentType: this.bosType(params.subagentType)
++		};
+ 		const executableConfig = this.configs.get(params.subagentType);
+ 		if (executableConfig == null) {
+-			const available = [...this.configs.keys()].join(", ");
++			const available = [...this.configs.keys()].filter((type) => !String(type).startsWith("agent_")).concat([...this.bosAliases.keys()]).join(", ");
+ 			return Promise.resolve(createSubagentFailure(`Error: Unknown subagent type "${params.subagentType}". Available types: ${available}`));
+ 		}
+ 		if (this.maxDepth <= 0) return Promise.resolve(createSubagentFailure("Error: Maximum subagent nesting depth exceeded."));
