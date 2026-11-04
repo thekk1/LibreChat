@@ -777,11 +777,13 @@ const isBuiltInTool = (toolName) =>
       nativeTools.has(toolName),
   );
 
-/** BOS patch (mcp-credentials): how long a subagent waits for user variables, and how often it looks. */
-const MCP_CREDENTIALS_WAIT_MS = 600000;
-const MCP_CREDENTIALS_POLL_MS = 2000;
+/** BOS patch (mcp-credentials): the result of a subagent that must not start, per request and agent. */
+function noteSubagentNotStarted(req, agentId, result) {
+  req.bosSubagentNotStarted ??= new Map();
+  req.bosSubagentNotStarted.set(agentId, result);
+}
 
-/** BOS patch (mcp-credentials): subagents start at the same time and read the same content length.
+/** BOS patch (subagent-oauth): subagents start at the same time and read the same content length.
  *  Each sign-in step gets its own index, otherwise the later step replaces the earlier one. */
 const authStepIndexes = new Map();
 function reserveAuthStepIndexes(streamId, contentLength, count) {
@@ -1427,6 +1429,11 @@ async function loadToolDefinitionsWrapper({
         logger.warn('[Tool Definitions] Failed to cancel a pending MCP OAuth flow', error);
       }
     }
+    noteSubagentNotStarted(
+      req,
+      agent.id,
+      `The subagent did not start: the sign-in to ${Array.from(pendingOAuthServers).join(', ')} is missing. Tell the user to ask again and to sign in with the button that then appears. Do not start this subagent again in this turn.`,
+    );
   } else if (pendingOAuthServers.size > 0 && (res || streamId)) {
     const serverNames = Array.from(pendingOAuthServers);
     logger.info(
@@ -1481,6 +1488,17 @@ async function loadToolDefinitionsWrapper({
       .filter((result) => result.success)
       .map((result) => result.serverName);
 
+    /** BOS patch (mcp-credentials): without the sign-in the subagent has no tools of this server. */
+    const failedServers = results.filter((result) => !result.success).map((result) => result.serverName);
+    if (failedServers.length > 0 && skipMCPOAuthWait) {
+      logger.info('[Tool Definitions] MCP OAuth not completed; subagent does not start');
+      noteSubagentNotStarted(
+        req,
+        agent.id,
+        `The subagent did not start: the sign-in to ${failedServers.join(', ')} was not completed. Tell the user to ask again and to sign in with the button that then appears. Do not start this subagent again in this turn.`,
+      );
+    }
+
     if (successfulServers.length > 0) {
       logger.info(
         `[Tool Definitions] Reloading tools after OAuth for ${successfulServers.length} server(s)`,
@@ -1518,96 +1536,20 @@ async function loadToolDefinitionsWrapper({
     }
   }
 
-  /** BOS patch (mcp-credentials): a server with user variables has no sign-in step of its own and
-   *  LibreChat leaves it out without telling the user. Show the sign-in step with a link to the
-   *  form that stores the variables, and wait for them like for an OAuth sign-in. */
-  if (pendingCredentialServers.size > 0 && (res || streamId)) {
-    const serverNames = Array.from(pendingCredentialServers);
-    let credentialIndexOffset = 0;
-    let canShowStep = true;
-    if (skipMCPOAuthWait) {
-      try {
-        const parts = streamId
-          ? await GenerationJobManager.jobStore?.getContentParts?.(streamId, jobCreatedAt)
-          : null;
-        if (Array.isArray(parts?.content)) {
-          credentialIndexOffset = reserveAuthStepIndexes(
-            streamId,
-            parts.content.length,
-            serverNames.length,
-          );
-        } else {
-          canShowStep = false;
-        }
-      } catch (error) {
-        canShowStep = false;
-        logger.warn('[Tool Definitions] Failed to read the parent content for MCP credentials', error);
-      }
-    }
-
-    const results = canShowStep
-      ? await Promise.all(
-          serverNames.map(async (serverName, index) => {
-            const authURL = `${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)}`;
-            logger.info('[Tool Definitions] MCP user variables missing; showing the form link');
-            await createOAuthEmitter(serverName, credentialIndexOffset + index)(authURL);
-            const key = `${Constants.mcp_prefix}${serverName}`;
-            const serverConfig =
-              configServers?.[serverName] ??
-              (await getMCPServersRegistry().getServerConfig(serverName, req.user.id, configServers));
-            const deadline = Date.now() + MCP_CREDENTIALS_WAIT_MS;
-            while (Date.now() < deadline && !signal?.aborted) {
-              await new Promise((resolve) => setTimeout(resolve, MCP_CREDENTIALS_POLL_MS));
-              const authMap = await getUserMCPAuthMap({
-                tools: filteredTools,
-                userId: req.user.id,
-                serverNames: mcpRawServerNames,
-                findPluginAuthsByKeys,
-              });
-              if (getMissingCustomUserVars(serverConfig, authMap?.[key]).length === 0) {
-                userMCPAuthMap = { ...userMCPAuthMap, [key]: authMap[key] };
-                await createOAuthEndEmitter(serverName)();
-                return true;
-              }
-            }
-            logger.info('[Tool Definitions] MCP user variables not stored in time');
-            return false;
-          }),
-        )
-      : [];
-
-    if (results.some(Boolean)) {
-      const reloadResult = await loadToolDefinitions(
-        {
-          userId: req.user.id,
-          agentId: agent.id,
-          tools: defsFilteredTools,
-          toolOptions: agent.tool_options,
-          deferredToolsEnabled,
-          programmaticToolsEnabled,
-          codeExecutionEnabled,
-          codeExecutionContext: resolvedCodeExecutionContext,
-          codeEnvironments: appConfig?.endpoints?.agents?.statefulCodeSessions?.environments,
-          getAppConfig,
-          provider: agent.provider,
-          mcpServerNames,
-          rawServerNames: mcpRawServerNames,
-          accessibleServerNames: defsAccessibleServerNames,
-        },
-        {
-          isBuiltInTool,
-          getOrFetchMCPServerTools,
-          refreshMCPServerTools,
-          getActionToolDefinitions,
-        },
-      );
-      toolDefinitions = reloadResult.toolDefinitions;
-      toolRegistry = reloadResult.toolRegistry;
-      hasDeferredTools = reloadResult.hasDeferredTools;
-      mcpToolAliases = reloadResult.mcpToolAliases;
-      mcpResolution = reloadResult.mcpResolution;
-      oauthActionToolNames = reloadResult.oauthActionToolNames;
-    }
+  /** BOS patch (mcp-credentials): LibreChat leaves out a server without the user's variables and starts
+   *  the subagent anyway, which only finds out that its tools are missing after a model call. Note
+   *  the result here; initialize.js ends the subagent with it before the model runs. */
+  if (pendingCredentialServers.size > 0 && skipMCPOAuthWait) {
+    const links = Array.from(pendingCredentialServers).map(
+      (serverName) =>
+        `[Zugangsdaten für ${serverName} hinterlegen](${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)})`,
+    );
+    logger.info('[Tool Definitions] MCP user variables missing; subagent does not start');
+    noteSubagentNotStarted(
+      req,
+      agent.id,
+      `The subagent did not start: the user has not stored the credentials it needs. Tell the user and give them this link unchanged: ${links.join(', ')}. After saving they can ask again. Do not start this subagent again in this turn.`,
+    );
   }
 
   if (hasExpectedMCPTools && mcpResolution?.resolvedToolCount === 0) {

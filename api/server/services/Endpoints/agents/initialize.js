@@ -1369,7 +1369,14 @@ const initializeClientWithProvider = async ({
   const initializeLazySubagent = async ({ agentId, configId, context, lazyChildren }) => {
     throwIfAborted(context.signal);
     const agent = await waitForAbort(db.getAgentWithVersionCount({ id: agentId }), context.signal);
-    return initializeLoadedSubagent({ agent, agentId, configId, context, lazyChildren });
+    const config = await initializeLoadedSubagent({ agent, agentId, configId, context, lazyChildren });
+    /** BOS patch (mcp-credentials): ends the subagent with this result before its first model call. */
+    const notStarted = req.bosSubagentNotStarted?.get(agentId);
+    if (notStarted) {
+      req.bosSubagentNotStarted.delete(agentId);
+      throw Object.assign(new Error('Subagent did not start'), { bosSubagentResult: notStarted });
+    }
+    return config;
   };
 
   const buildLazySubagentDescriptors = async (agent, depth = 0, ancestors = new Set()) => {
