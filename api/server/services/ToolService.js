@@ -777,6 +777,20 @@ const isBuiltInTool = (toolName) =>
       nativeTools.has(toolName),
   );
 
+/** BOS patch (mcp-credentials): how long a subagent waits for user variables, and how often it looks. */
+const MCP_CREDENTIALS_WAIT_MS = 600000;
+const MCP_CREDENTIALS_POLL_MS = 2000;
+
+/** BOS patch (mcp-credentials): subagents start at the same time and read the same content length.
+ *  Each sign-in step gets its own index, otherwise the later step replaces the earlier one. */
+const authStepIndexes = new Map();
+function reserveAuthStepIndexes(streamId, contentLength, count) {
+  const start = Math.max(contentLength, authStepIndexes.get(streamId) ?? 0);
+  authStepIndexes.set(streamId, start + count);
+  setTimeout(() => authStepIndexes.delete(streamId), 3600000).unref();
+  return start;
+}
+
 /**
  * Loads only tool definitions without creating tool instances.
  * This is the efficient path for event-driven mode where tools are loaded on-demand.
@@ -992,6 +1006,7 @@ async function loadToolDefinitionsWrapper({
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
+  const pendingCredentialServers = new Set();
   const pendingOAuthServers = new Set();
   const pendingOAuthStarts = new Map();
   const emittedOAuthStarts = new Map();
@@ -1167,6 +1182,7 @@ async function loadToolDefinitionsWrapper({
       logger.warn('[Tool Definitions] Skipping one MCP server with missing user configuration', {
         missingVariableCount: missingUserVars.length,
       });
+      pendingCredentialServers.add(serverName);
       return null;
     }
 
@@ -1381,7 +1397,7 @@ async function loadToolDefinitionsWrapper({
       logger.warn('[Tool Definitions] Failed to read the parent content for MCP OAuth', error);
     }
     if (typeof parentContentLength === 'number') {
-      oauthIndexOffset = parentContentLength;
+      oauthIndexOffset = reserveAuthStepIndexes(streamId, parentContentLength, pendingOAuthServers.size);
       logger.info(`[Tool Definitions] Subagent MCP OAuth step at parent content index ${oauthIndexOffset}`);
     } else {
       subagentSkipsOAuth = true;
@@ -1469,6 +1485,98 @@ async function loadToolDefinitionsWrapper({
       logger.info(
         `[Tool Definitions] Reloading tools after OAuth for ${successfulServers.length} server(s)`,
       );
+      const reloadResult = await loadToolDefinitions(
+        {
+          userId: req.user.id,
+          agentId: agent.id,
+          tools: defsFilteredTools,
+          toolOptions: agent.tool_options,
+          deferredToolsEnabled,
+          programmaticToolsEnabled,
+          codeExecutionEnabled,
+          codeExecutionContext: resolvedCodeExecutionContext,
+          codeEnvironments: appConfig?.endpoints?.agents?.statefulCodeSessions?.environments,
+          getAppConfig,
+          provider: agent.provider,
+          mcpServerNames,
+          rawServerNames: mcpRawServerNames,
+          accessibleServerNames: defsAccessibleServerNames,
+        },
+        {
+          isBuiltInTool,
+          getOrFetchMCPServerTools,
+          refreshMCPServerTools,
+          getActionToolDefinitions,
+        },
+      );
+      toolDefinitions = reloadResult.toolDefinitions;
+      toolRegistry = reloadResult.toolRegistry;
+      hasDeferredTools = reloadResult.hasDeferredTools;
+      mcpToolAliases = reloadResult.mcpToolAliases;
+      mcpResolution = reloadResult.mcpResolution;
+      oauthActionToolNames = reloadResult.oauthActionToolNames;
+    }
+  }
+
+  /** BOS patch (mcp-credentials): a server with user variables has no sign-in step of its own and
+   *  LibreChat leaves it out without telling the user. Show the sign-in step with a link to the
+   *  form that stores the variables, and wait for them like for an OAuth sign-in. */
+  if (pendingCredentialServers.size > 0 && (res || streamId)) {
+    const serverNames = Array.from(pendingCredentialServers);
+    let credentialIndexOffset = 0;
+    let canShowStep = true;
+    if (skipMCPOAuthWait) {
+      try {
+        const parts = streamId
+          ? await GenerationJobManager.jobStore?.getContentParts?.(streamId, jobCreatedAt)
+          : null;
+        if (Array.isArray(parts?.content)) {
+          credentialIndexOffset = reserveAuthStepIndexes(
+            streamId,
+            parts.content.length,
+            serverNames.length,
+          );
+        } else {
+          canShowStep = false;
+        }
+      } catch (error) {
+        canShowStep = false;
+        logger.warn('[Tool Definitions] Failed to read the parent content for MCP credentials', error);
+      }
+    }
+
+    const results = canShowStep
+      ? await Promise.all(
+          serverNames.map(async (serverName, index) => {
+            const authURL = `${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)}`;
+            logger.info('[Tool Definitions] MCP user variables missing; showing the form link');
+            await createOAuthEmitter(serverName, credentialIndexOffset + index)(authURL);
+            const key = `${Constants.mcp_prefix}${serverName}`;
+            const serverConfig =
+              configServers?.[serverName] ??
+              (await getMCPServersRegistry().getServerConfig(serverName, req.user.id, configServers));
+            const deadline = Date.now() + MCP_CREDENTIALS_WAIT_MS;
+            while (Date.now() < deadline && !signal?.aborted) {
+              await new Promise((resolve) => setTimeout(resolve, MCP_CREDENTIALS_POLL_MS));
+              const authMap = await getUserMCPAuthMap({
+                tools: filteredTools,
+                userId: req.user.id,
+                serverNames: mcpRawServerNames,
+                findPluginAuthsByKeys,
+              });
+              if (getMissingCustomUserVars(serverConfig, authMap?.[key]).length === 0) {
+                userMCPAuthMap = { ...userMCPAuthMap, [key]: authMap[key] };
+                await createOAuthEndEmitter(serverName)();
+                return true;
+              }
+            }
+            logger.info('[Tool Definitions] MCP user variables not stored in time');
+            return false;
+          }),
+        )
+      : [];
+
+    if (results.some(Boolean)) {
       const reloadResult = await loadToolDefinitions(
         {
           userId: req.user.id,

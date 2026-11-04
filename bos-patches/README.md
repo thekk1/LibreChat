@@ -19,6 +19,10 @@ the file from the image, and the patched file is mounted read-only into the cont
 | `validation-feedback.diff` | `packages/api/dist/index.cjs` (same file as `ask-user-question-json.diff`) | the schema error of a tool in the graph counts undeclared arguments and names the declared ones, checks `integer` and `enum` and every field |
 | `client-bundle-mkpatch.js` | chunks in `client/dist/assets` and `client/dist/sw.js` | file table with 100 rows per page, legal footer links in a new tab, videos in markdown images (`.mp4`, `.webm`, …) as a video player, new service worker revision |
 
+`mcp-zugang/index.html` is the form behind the sign-in step for missing MCP user variables (commit on this branch,
+`api/server/services/ToolService.js`). It is mounted at `client/dist/mcp-zugang` and stores the values through
+`POST /api/user/plugins`.
+
 `client-bundle-mkpatch.js` generates the patched chunks from the original files of the image:
 
 ```bash

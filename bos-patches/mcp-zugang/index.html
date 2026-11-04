@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Zugangsdaten hinterlegen</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1f1f1f; --muted: #5f6368; --bg: #fff; --line: #d9d9d9; --accent: #0f6f6a; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececec; --muted: #a8a8a8; --bg: #1c1c1c; --line: #444; --accent: #3fb8af; --err: #f28b82; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+  main { max-width: 420px; margin: 8vh auto; padding: 0 20px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  label { display: block; margin: 16px 0 4px; font-weight: 600; }
+  input { box-sizing: border-box; width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; font: inherit; }
+  small { display: block; margin-top: 4px; color: var(--muted); }
+  button { margin-top: 20px; padding: 9px 18px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { margin-top: 14px; color: var(--err); }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Zugangsdaten hinterlegen</h1>
+  <p id="status">Wird geladen …</p>
+  <form id="form" hidden autocomplete="off"></form>
+</main>
+<script>
+(function () {
+  var server = new URLSearchParams(location.search).get('server') || '';
+  var title = document.getElementById('title');
+  var status = document.getElementById('status');
+  var form = document.getElementById('form');
+  var token = null;
+
+  function fail(text) { status.textContent = text; status.className = 'err'; status.hidden = false; }
+  function api(path, options) {
+    options = options || {};
+    options.headers = Object.assign({ Authorization: 'Bearer ' + token }, options.headers || {});
+    options.credentials = 'same-origin';
+    return fetch(path, options);
+  }
+  function isPlain(field) {
+    return field.sensitive === false || /(MAIL|USER|URL|CLOUD_ID)/i.test(field.authField);
+  }
+
+  fetch('/api/auth/refresh', { method: 'POST', credentials: 'same-origin' })
+    .then(function (r) {
+      if (!r.ok) { location.href = '/login'; throw new Error('login'); }
+      return r.json();
+    })
+    .then(function (d) { token = d.token; return api('/api/mcp/tools'); })
+    .then(function (r) { if (!r.ok) throw new Error('tools ' + r.status); return r.json(); })
+    .then(function (d) {
+      var entry = d && d.servers && d.servers[server];
+      var fields = entry && entry.authConfig;
+      if (!fields || !fields.length) { fail('Für „' + server + '“ sind hier keine Zugangsdaten nötig.'); return; }
+      title.textContent = 'Zugangsdaten für ' + server;
+      fields.forEach(function (field) {
+        var label = document.createElement('label');
+        label.textContent = field.label || field.authField;
+        label.htmlFor = field.authField;
+        var input = document.createElement('input');
+        input.id = field.authField;
+        input.name = field.authField;
+        input.required = true;
+        input.type = isPlain(field) ? 'text' : 'password';
+        input.autocomplete = isPlain(field) ? 'off' : 'new-password';
+        form.appendChild(label);
+        form.appendChild(input);
+        if (field.description) {
+          var hint = document.createElement('small');
+          hint.textContent = field.description;
+          form.appendChild(hint);
+        }
+      });
+      var button = document.createElement('button');
+      button.type = 'submit';
+      button.textContent = 'Speichern';
+      form.appendChild(button);
+      status.hidden = true;
+      form.hidden = false;
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var auth = {};
+        fields.forEach(function (field) { auth[field.authField] = form.elements[field.authField].value.trim(); });
+        button.disabled = true;
+        status.hidden = true;
+        api('/api/user/plugins', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pluginKey: 'mcp_' + server, action: 'install', auth: auth }),
+        }).then(function (r) {
+          if (!r.ok) throw new Error('save ' + r.status);
+          form.hidden = true;
+          status.className = '';
+          status.textContent = 'Gespeichert. Du kannst diesen Tab schließen, der Chat läuft weiter.';
+          status.hidden = false;
+        }).catch(function () {
+          button.disabled = false;
+          fail('Speichern fehlgeschlagen. Bitte noch einmal versuchen.');
+        });
+      });
+    })
+    .catch(function (error) {
+      if (error.message !== 'login') fail('Die Seite konnte nicht geladen werden. Bitte neu laden.');
+    });
+})();
+</script>
+</body>
+</html>
