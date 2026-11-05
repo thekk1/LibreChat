@@ -2,6 +2,8 @@
 // - MyFilesModal: Tabelle "Meine Dateien" mit 100 statt 10 Zeilen je Seite.
 // - eventSelection: Datenschutz und Nutzungsbedingungen in der Fusszeile in einem neuen Tab
 //   (v0.8.8 uebergeht dort interface.*.openNewTab).
+//   Dazu nennt der Anmeldeknopf eines MCP-Servers das System ("Anmeldung an Trac") statt der Domain der
+//   Anmeldeseite, die bei allen Servern mit Keycloak gleich ist.
 // - hooks (MarkdownImage): ![Name](/images/....mp4) als Videospieler statt <img>, fuer Videos, die
 //   tool-files in die Antwort setzt.
 // - index (BadgeRow): ein Klick auf einen Link zu /mcp-zugang/ oeffnet den Zugangsdaten-Dialog von LibreChat
@@ -16,7 +18,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-6';
+const REVISION = 'bos-7';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -53,9 +55,11 @@ const chunks = {
   'MyFilesModal.D-V6_fYt.js': (js) => swap(js,
     'getPaginationRowModel:x(),onRowSelectionChange:l,',
     'getPaginationRowModel:x(),initialState:{pagination:{pageIndex:0,pageSize:100}},onRowSelectionChange:l,'),
-  'eventSelection.xdAX3598.js': (js) => swap(swap(js,
+  'eventSelection.xdAX3598.js': (js) => swap(swap(swap(js,
     'href:s.externalUrl,rel:`noreferrer`', 'href:s.externalUrl,target:`_blank`,rel:`noopener noreferrer`'),
     'href:c.externalUrl,rel:`noreferrer`', 'href:c.externalUrl,target:`_blank`,rel:`noopener noreferrer`'),
+    'children:_(`com_ui_sign_in_to_domain`,{0:H})',
+    'children:I&&L?`Anmeldung an ${L.charAt(0).toUpperCase()+L.slice(1)}`:_(`com_ui_sign_in_to_domain`,{0:H})'),
   'hooks.B1NLB7i6.js': (js) => swap(js,
     'return(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`',
     'return/\\.(mp4|m4v|webm|mov|ogv)([?#]|$)/i.test(s??``)?(0,J.jsx)(`video`,{src:s,controls:!0,preload:`metadata`,title:t||n,className:r,style:{maxWidth:`100%`,...i}}):(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`'),
