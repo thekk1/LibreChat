@@ -19,7 +19,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-8';
+const REVISION = 'bos-9';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -60,7 +60,7 @@ const chunks = {
     'href:s.externalUrl,rel:`noreferrer`', 'href:s.externalUrl,target:`_blank`,rel:`noopener noreferrer`'),
     'href:c.externalUrl,rel:`noreferrer`', 'href:c.externalUrl,target:`_blank`,rel:`noopener noreferrer`'),
     'children:_(`com_ui_sign_in_to_domain`,{0:H})',
-    'children:I&&L?`Anmeldung an ${L.charAt(0).toUpperCase()+L.slice(1)}`:_(`com_ui_sign_in_to_domain`,{0:H})'),
+    'title:I&&L?H:void 0,children:I&&L?`Anmeldung an ${L.charAt(0).toUpperCase()+L.slice(1)}`:_(`com_ui_sign_in_to_domain`,{0:H})'),
   'markdown.N65uYq6U.js': (js) => swap(js,
     '}\\`);\n}\n<\\/script>',
     '}\\`);\ndocument.getElementById(\'content\').querySelectorAll(\'a\').forEach(function(a){a.target=\'_blank\';a.rel=\'noopener noreferrer\'});\n}\n<\\/script>'),
