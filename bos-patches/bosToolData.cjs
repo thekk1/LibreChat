@@ -297,11 +297,34 @@ async function collect({ content, messages, user, conversationId }) {
 	for (const set of rankForStrip(text, stored)) text = stripTyped(text, set);
 	return stored.length === 0 ? text : `${text}\n\n${stored.map(handleLine).join("\n")}`;
 }
+/** Ziel eines Werts im Antworttext: Ticket, Issue, Job oder Datei im System, aus dem die Zeile stammt. */
+function linkOf(set, name, row) {
+	const [, tool, server] = String(set.source ?? "").match(/^(\S*)_mcp_(\S+)/) ?? [];
+	const value = String(row[name] ?? "");
+	if (server === "trac" && tool.startsWith("ticket_") && (name === "id" || name === "key")) {
+		return /^#?\d+$/.test(value) ? `http://tl.bos.local/trac/ticket/${value.replace("#", "")}` : null;
+	}
+	if (server === "jira-mercedes" && name === "key") {
+		return /^[A-Z][A-Z0-9_]*-\d+$/.test(value) ? `https://mercedes-benz.atlassian.net/browse/${value}` : null;
+	}
+	if (server === "gitea" && ["number", "full_name", "name"].includes(name)) return row.html_url || null;
+	if (server === "nextcloud" && ["name", "path"].includes(name)) return row.url || null;
+	if (server === "jenkins" && ["name", "fullname", "displayName", "number"].includes(name)) {
+		// Jenkins nennt seine Stammadresse http://jenkins:8090/, die nur mit passendem Suchsuffix aufloest.
+		return row.url ? String(row.url).replace(/^http:\/\/jenkins:8090\//, "http://jenkins.bos.local:8090/") : null;
+	}
+	return null;
+}
+function linked(set, name, row, text) {
+	const url = text === "" ? null : linkOf(set, name, row);
+	if (!url || !/^https?:\/\/[^\s()]+$/.test(url)) return text;
+	return `[${text.replace(/[[\]]/g, "\\$&")}](${url})`;
+}
 function formatRows(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
-	if (columns.length === 1) return set.rows.map((row) => row[columns[0]] ?? "").join(", ");
+	if (columns.length === 1) return set.rows.map((row) => linked(set, columns[0], row, String(row[columns[0]] ?? ""))).join(", ");
 	const escape = (value) => String(value ?? "").replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
-	return [`| ${columns.join(" | ")} |`, `|${columns.map(() => "---").join("|")}|`, ...set.rows.map((row) => `| ${columns.map((name) => escape(row[name])).join(" | ")} |`)].join("\n");
+	return [`| ${columns.join(" | ")} |`, `|${columns.map(() => "---").join("|")}|`, ...set.rows.map((row) => `| ${columns.map((name) => linked(set, name, row, escape(row[name]))).join(" | ")} |`)].join("\n");
 }
 /** Setzt Verweise ein. Nur Daten desselben Nutzers und Chats sind erreichbar. */
 /** Lange Listen gehoeren in ein Artefakt, nicht in den Chatverlauf. */
@@ -494,4 +517,4 @@ function createAnswerFilter({ renderFiles } = {}) {
 		}
 	};
 }
-module.exports = { collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };
+module.exports = { formatRows, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };

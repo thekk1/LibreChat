@@ -4,6 +4,7 @@
 //   (v0.8.8 uebergeht dort interface.*.openNewTab).
 //   Dazu nennt der Anmeldeknopf eines MCP-Servers das System ("Anmeldung an Trac") statt der Domain der
 //   Anmeldeseite, die bei allen Servern mit Keycloak gleich ist.
+// - markdown: Links in Markdown-Artefakten in einem neuen Tab; ohne target oeffnet der Klick im iframe der Vorschau.
 // - hooks (MarkdownImage): ![Name](/images/....mp4) als Videospieler statt <img>, fuer Videos, die
 //   tool-files in die Antwort setzt.
 // - index (BadgeRow): ein Klick auf einen Link zu /mcp-zugang/ oeffnet den Zugangsdaten-Dialog von LibreChat
@@ -18,7 +19,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-7';
+const REVISION = 'bos-8';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -60,6 +61,9 @@ const chunks = {
     'href:c.externalUrl,rel:`noreferrer`', 'href:c.externalUrl,target:`_blank`,rel:`noopener noreferrer`'),
     'children:_(`com_ui_sign_in_to_domain`,{0:H})',
     'children:I&&L?`Anmeldung an ${L.charAt(0).toUpperCase()+L.slice(1)}`:_(`com_ui_sign_in_to_domain`,{0:H})'),
+  'markdown.N65uYq6U.js': (js) => swap(js,
+    '}\\`);\n}\n<\\/script>',
+    '}\\`);\ndocument.getElementById(\'content\').querySelectorAll(\'a\').forEach(function(a){a.target=\'_blank\';a.rel=\'noopener noreferrer\'});\n}\n<\\/script>'),
   'hooks.B1NLB7i6.js': (js) => swap(js,
     'return(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`',
     'return/\\.(mp4|m4v|webm|mov|ogv)([?#]|$)/i.test(s??``)?(0,J.jsx)(`video`,{src:s,controls:!0,preload:`metadata`,title:t||n,className:r,style:{maxWidth:`100%`,...i}}):(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`'),
