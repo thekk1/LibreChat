@@ -1,0 +1,463 @@
+From db86d9f2f5c0f898fa31ae9cb710b45d5dd690dd Mon Sep 17 00:00:00 2001
+From: Marc Siebenhaar <marc.siebenhaar@top-logic.com>
+Date: Thu, 5 Nov 2026 07:58:49 +0100
+Subject: [PATCH] =?UTF-8?q?=E2=8F=B3=20feat:=20Count=20Chat=20Retention=20?=
+ =?UTF-8?q?From=20the=20Last=20Message?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under retentionMode: "all" a chat's deadline is fixed when it is created, so a
+chat in daily use disappears with all its messages when the period ends.
+
+interface.renewRetentionOnActivity moves the deadline to one retention period
+from now when a message is sent. The messages, tool calls, shared links and
+subagent threads of the chat move with it, and a chat is rewritten at most once
+an hour. Temporary, expired and event-bound chats keep their deadline, and files
+keep their own. The switch is off by default.
+---
+ .../validate/renewConvoRetention.js           |  28 ++++
+ .../validate/renewConvoRetention.spec.js      |  55 +++++++
+ api/server/routes/agents/chat.js              |   5 +-
+ librechat.example.yaml                        |   3 +
+ packages/data-provider/src/config.ts          |   1 +
+ packages/data-schemas/src/app/interface.ts    |   1 +
+ .../src/methods/conversation.spec.ts          | 149 ++++++++++++++++++
+ .../data-schemas/src/methods/conversation.ts  |  78 +++++++++
+ 8 files changed, 318 insertions(+), 2 deletions(-)
+ create mode 100644 api/server/middleware/validate/renewConvoRetention.js
+ create mode 100644 api/server/middleware/validate/renewConvoRetention.spec.js
+
+diff --git a/api/server/middleware/validate/renewConvoRetention.js b/api/server/middleware/validate/renewConvoRetention.js
+new file mode 100644
+index 00000000..0e5f254d
+--- /dev/null
++++ b/api/server/middleware/validate/renewConvoRetention.js
+@@ -0,0 +1,28 @@
++const { logger } = require('@librechat/data-schemas');
++const { renewConversationRetention } = require('~/models');
++
++/**
++ * Counts a new message as activity under `interface.renewRetentionOnActivity`. Runs after
++ * `validateConvoAccess`, and hands the new deadline to the turn's writes through
++ * `req.resolvedConversation`, so they do not stamp the old one.
++ */
++const renewConvoRetention = async (req, _res, next) => {
++  const conversation = req.resolvedConversation;
++  if (conversation == null) {
++    return next();
++  }
++  try {
++    const expiredAt = await renewConversationRetention(
++      { userId: req.user?.id ?? '', interfaceConfig: req.config?.interfaceConfig },
++      conversation.conversationId,
++    );
++    if (expiredAt != null) {
++      req.resolvedConversation = { ...conversation, expiredAt, isTemporary: false };
++    }
++  } catch (error) {
++    logger.error('[renewConvoRetention] Error renewing conversation retention', error);
++  }
++  next();
++};
++
++module.exports = renewConvoRetention;
+diff --git a/api/server/middleware/validate/renewConvoRetention.spec.js b/api/server/middleware/validate/renewConvoRetention.spec.js
+new file mode 100644
+index 00000000..c67da771
+--- /dev/null
++++ b/api/server/middleware/validate/renewConvoRetention.spec.js
+@@ -0,0 +1,55 @@
++const mockRenew = jest.fn();
++
++jest.mock('@librechat/data-schemas', () => ({ logger: { error: jest.fn() } }));
++jest.mock('~/models', () => ({ renewConversationRetention: mockRenew }));
++
++const { logger } = require('@librechat/data-schemas');
++const renewConvoRetention = require('./renewConvoRetention');
++
++const interfaceConfig = { renewRetentionOnActivity: true };
++
++function createRequest(resolvedConversation) {
++  return { user: { id: 'user' }, config: { interfaceConfig }, resolvedConversation };
++}
++
++describe('renewConvoRetention', () => {
++  const next = jest.fn();
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  it.each([[null], [undefined]])('skips a request with conversation %s', async (conversation) => {
++    await renewConvoRetention(createRequest(conversation), {}, next);
++    expect(mockRenew).not.toHaveBeenCalled();
++    expect(next).toHaveBeenCalledTimes(1);
++  });
++
++  it("hands the new deadline to the turn's writes", async () => {
++    const expiredAt = new Date('2027-01-01T00:00:00Z');
++    mockRenew.mockResolvedValue(expiredAt);
++    const req = createRequest({ conversationId: 'chat', expiredAt: new Date(0) });
++    await renewConvoRetention(req, {}, next);
++    expect(mockRenew).toHaveBeenCalledWith({ userId: 'user', interfaceConfig }, 'chat');
++    expect(req.resolvedConversation).toMatchObject({ expiredAt, isTemporary: false });
++    expect(next).toHaveBeenCalledTimes(1);
++  });
++
++  it('keeps the stored deadline when nothing was renewed', async () => {
++    mockRenew.mockResolvedValue(null);
++    const conversation = { conversationId: 'chat', expiredAt: new Date(0) };
++    const req = createRequest(conversation);
++    await renewConvoRetention(req, {}, next);
++    expect(req.resolvedConversation).toBe(conversation);
++  });
++
++  it('does not fail the turn when the renewal fails', async () => {
++    mockRenew.mockRejectedValue(new Error('database down'));
++    const conversation = { conversationId: 'chat' };
++    const req = createRequest(conversation);
++    await renewConvoRetention(req, {}, next);
++    expect(logger.error).toHaveBeenCalled();
++    expect(req.resolvedConversation).toBe(conversation);
++    expect(next).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/api/server/routes/agents/chat.js b/api/server/routes/agents/chat.js
+index 84d3f44a..ff75f679 100644
+--- a/api/server/routes/agents/chat.js
++++ b/api/server/routes/agents/chat.js
+@@ -21,6 +21,7 @@ const {
+ } = require('~/server/middleware');
+ const { initializeClient } = require('~/server/services/Endpoints/agents');
+ const guardSubagentThreadTurn = require('~/server/middleware/validate/subagentThreadTurn');
++const renewConvoRetention = require('~/server/middleware/validate/renewConvoRetention');
+ const AgentController = require('~/server/controllers/agents/request');
+ const ResumeController = require('~/server/controllers/agents/resume');
+ const addTitle = require('~/server/services/Endpoints/agents/title');
+@@ -107,7 +108,7 @@ router.post('/resume', resumeController);
+  * @param {express.Response} res - The response object, used to send back a response.
+  * @returns {void}
+  */
+-router.post('/', controller);
++router.post('/', renewConvoRetention, controller);
+ 
+ /**
+  * @route POST /:endpoint (ephemeral agents)
+@@ -117,6 +118,6 @@ router.post('/', controller);
+  * @param {express.Response} res - The response object, used to send back a response.
+  * @returns {void}
+  */
+-router.post('/:endpoint', controller);
++router.post('/:endpoint', renewConvoRetention, controller);
+ 
+ module.exports = router;
+diff --git a/librechat.example.yaml b/librechat.example.yaml
+index 832dedec..9f9b4baa 100644
+--- a/librechat.example.yaml
++++ b/librechat.example.yaml
+@@ -445,6 +445,9 @@ interface:
+   # Regular chat retention in hours under retentionMode: "all" (min: 1, max: 8760).
+   # Defaults to the temporary chat retention policy when omitted.
+   # generalChatRetention: 2160 # 90 days, independently of temporary chats
++  # Under retentionMode: "all" with generalChatRetention set, count that period from the chat's
++  # last message instead of its creation. Sending a message moves the whole chat's deadline.
++  # renewRetentionOnActivity: true
+   # Existing stored deadlines are not migrated when these settings change.
+   # Retention mode: "temporary" (default) applies expiry only to chats users mark temporary;
+   # "all" applies expiry to all data types while keeping chats visible in history;
+diff --git a/packages/data-provider/src/config.ts b/packages/data-provider/src/config.ts
+index df875c20..2d61d75f 100644
+--- a/packages/data-provider/src/config.ts
++++ b/packages/data-provider/src/config.ts
+@@ -3180,6 +3180,7 @@ export const interfaceSchema = z
+     temporaryChat: z.boolean().optional(),
+     temporaryChatRetention: z.number().min(1).max(8760).optional(),
+     generalChatRetention: z.number().min(1).max(8760).optional(),
++    renewRetentionOnActivity: z.boolean().optional(),
+     autoSubmitFromUrl: z.boolean().optional(),
+     /** Accept `?theme=dark|light|system` on an entry link as the user's colour mode, so another app can hand its mode over. */
+     colorModeFromUrl: z.boolean().optional(),
+diff --git a/packages/data-schemas/src/app/interface.ts b/packages/data-schemas/src/app/interface.ts
+index 08b9d20e..04fbd9bd 100644
+--- a/packages/data-schemas/src/app/interface.ts
++++ b/packages/data-schemas/src/app/interface.ts
+@@ -126,6 +126,7 @@ export async function loadDefaultInterface({
+     temporaryChat: interfaceConfig?.temporaryChat,
+     temporaryChatRetention: interfaceConfig?.temporaryChatRetention,
+     generalChatRetention: interfaceConfig?.generalChatRetention,
++    renewRetentionOnActivity: interfaceConfig?.renewRetentionOnActivity,
+     retentionMode: interfaceConfig?.retentionMode,
+     retainAgentFiles: interfaceConfig?.retainAgentFiles,
+     runCode: interfaceConfig?.runCode,
+diff --git a/packages/data-schemas/src/methods/conversation.spec.ts b/packages/data-schemas/src/methods/conversation.spec.ts
+index ecea2ae3..3b275de3 100644
+--- a/packages/data-schemas/src/methods/conversation.spec.ts
++++ b/packages/data-schemas/src/methods/conversation.spec.ts
+@@ -10355,4 +10355,153 @@ describe('getConvosLaneGit', () => {
+   it('asks nothing for an empty list', async () => {
+     await expect(methods.getConvosLaneGit('bulk-user', [])).resolves.toEqual([]);
+   });
++
++  describe('renewConversationRetention', () => {
++    const interfaceConfig = {
++      retentionMode: RetentionMode.ALL,
++      generalChatRetention: 2160,
++      renewRetentionOnActivity: true,
++    } as AppConfig['interfaceConfig'];
++    const userId = new mongoose.Types.ObjectId().toString();
++    const inDays = (days: number) => new Date(Date.now() + days * 24 * 60 * 60_000);
++    const expectRenewed = (date?: Date | null) => {
++      expect(date).toBeInstanceOf(Date);
++      expect(Math.abs((date as Date).getTime() - inDays(90).getTime())).toBeLessThan(60_000);
++    };
++
++    const seedChat = async (fields: Partial<IConversation>) => {
++      const conversationId = uuidv4();
++      await Conversation.create({
++        conversationId,
++        user: userId,
++        endpoint: EModelEndpoint.agents,
++        isTemporary: false,
++        ...fields,
++      });
++      await mongoose.models.Message.create({
++        messageId: uuidv4(),
++        conversationId,
++        user: userId,
++        isTemporary: fields.isTemporary ?? false,
++        expiredAt: fields.expiredAt,
++      });
++      return conversationId;
++    };
++    const messageDeadline = async (conversationId: string) =>
++      (await mongoose.models.Message.findOne({ conversationId }).lean<IMessage>())?.expiredAt;
++    const chatDeadline = async (conversationId: string) =>
++      (await Conversation.findOne({ conversationId }).lean<IConversation>())?.expiredAt;
++
++    it('moves the deadline of the chat and its messages', async () => {
++      const conversationId = await seedChat({ expiredAt: inDays(10) });
++      const renewed = await methods.renewConversationRetention(
++        { userId, interfaceConfig },
++        conversationId,
++      );
++      expectRenewed(renewed);
++      expect(await chatDeadline(conversationId)).toEqual(renewed);
++      expect(await messageDeadline(conversationId)).toEqual(renewed);
++    });
++
++    it('moves subagent threads, tool calls and shared links with the chat', async () => {
++      const conversationId = await seedChat({ expiredAt: inDays(10) });
++      const threadId = await seedChat({
++        expiredAt: inDays(10),
++        subagentThread: {
++          rootConversationId: conversationId,
++          parentConversationId: conversationId,
++          parentMessageId: 'message',
++          parentToolCallId: 'tool-call',
++          subagentType: 'research',
++          subagentKind: 'agent',
++          depth: 1,
++        },
++      });
++      await mongoose.models.ToolCall.create({
++        conversationId,
++        messageId: 'message',
++        toolId: 'tool',
++        user: userId,
++        expiredAt: inDays(10),
++      });
++      await mongoose.models.SharedLink.create({
++        conversationId,
++        user: userId,
++        shareId: uuidv4(),
++        expiredAt: inDays(10),
++      });
++      const renewed = await methods.renewConversationRetention(
++        { userId, interfaceConfig },
++        conversationId,
++      );
++      expect(await chatDeadline(threadId)).toEqual(renewed);
++      expect(await messageDeadline(threadId)).toEqual(renewed);
++      const toolCall = await mongoose.models.ToolCall.findOne({ conversationId }).lean<{
++        expiredAt?: Date;
++      }>();
++      expect(toolCall?.expiredAt).toEqual(renewed);
++      const share = await mongoose.models.SharedLink.findOne({ conversationId }).lean<{
++        expiredAt?: Date;
++      }>();
++      expect(share?.expiredAt).toEqual(renewed);
++    });
++
++    it('stamps a chat stored before retention applied, with all its messages', async () => {
++      const conversationId = await seedChat({});
++      const renewed = await methods.renewConversationRetention(
++        { userId, interfaceConfig },
++        conversationId,
++      );
++      expectRenewed(renewed);
++      expect(await messageDeadline(conversationId)).toEqual(renewed);
++    });
++
++    it('does not rewrite a chat renewed within the last hour', async () => {
++      const deadline = inDays(90);
++      const conversationId = await seedChat({ expiredAt: deadline });
++      expect(
++        await methods.renewConversationRetention({ userId, interfaceConfig }, conversationId),
++      ).toBeNull();
++      expect(await chatDeadline(conversationId)).toEqual(deadline);
++    });
++
++    it.each([
++      ['the switch is off', { ...interfaceConfig, renewRetentionOnActivity: false }],
++      ['retention covers temporary chats only', { ...interfaceConfig, retentionMode: undefined }],
++      ['no general retention is set', { ...interfaceConfig, generalChatRetention: undefined }],
++    ])('leaves the deadline alone when %s', async (_name, config) => {
++      const deadline = inDays(10);
++      const conversationId = await seedChat({ expiredAt: deadline });
++      expect(
++        await methods.renewConversationRetention(
++          { userId, interfaceConfig: config as AppConfig['interfaceConfig'] },
++          conversationId,
++        ),
++      ).toBeNull();
++      expect(await chatDeadline(conversationId)).toEqual(deadline);
++    });
++
++    it.each([
++      ['temporary', { isTemporary: true, expiredAt: inDays(10) }],
++      ['already expired', { expiredAt: inDays(-1) }],
++    ])('does not renew a chat that is %s', async (_name, fields) => {
++      const conversationId = await seedChat(fields);
++      expect(
++        await methods.renewConversationRetention({ userId, interfaceConfig }, conversationId),
++      ).toBeNull();
++      expect(await chatDeadline(conversationId)).toEqual(fields.expiredAt);
++    });
++
++    it("does not touch another user's chat", async () => {
++      const deadline = inDays(10);
++      const conversationId = await seedChat({ expiredAt: deadline });
++      expect(
++        await methods.renewConversationRetention(
++          { userId: new mongoose.Types.ObjectId().toString(), interfaceConfig },
++          conversationId,
++        ),
++      ).toBeNull();
++      expect(await chatDeadline(conversationId)).toEqual(deadline);
++    });
++  });
+ });
+diff --git a/packages/data-schemas/src/methods/conversation.ts b/packages/data-schemas/src/methods/conversation.ts
+index 16bbe611..2b1b7574 100644
+--- a/packages/data-schemas/src/methods/conversation.ts
++++ b/packages/data-schemas/src/methods/conversation.ts
+@@ -96,6 +96,7 @@ const AGENT_EVENT_ACTOR_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60_000;
+ const MAX_AGENT_EVENT_ACTOR_SUSPENSION_BYTES = 64 * 1_024;
+ /** MeiliSearch's default `pagination.maxTotalHits` ceiling. */
+ const MEILI_SEARCH_LIMIT = 1000;
++const RETENTION_RENEWAL_INTERVAL_MS = 60 * 60_000;
+ /** Ceiling for a single conversation page; the sidebar's largest request is 100. */
+ const MAX_CONVO_PAGE_SIZE = 100;
+ const DEFAULT_CONVO_PAGE_SIZE = 25;
+@@ -329,6 +330,16 @@ export interface ConversationMethods {
+     ctx: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
+     target: { conversationId: string; messageIds?: string[] },
+   ): Promise<void>;
++  /**
++   * Moves a chat's retention deadline to one retention period from now, with the messages, tool
++   * calls, shared links and subagent threads that carry the same deadline. Returns the new
++   * deadline, or `null` when the switch is off or the chat is temporary, expired, or renewed
++   * within the last hour.
++   */
++  renewConversationRetention(
++    ctx: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
++    conversationId: string,
++  ): Promise<Date | null>;
+   setConvoPinned(
+     user: string,
+     conversationId: string,
+@@ -2311,6 +2322,72 @@ export function createConversationMethods(
+     }
+   }
+ 
++  async function renewConversationRetention(
++    { userId, interfaceConfig }: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
++    conversationId: string,
++  ): Promise<Date | null> {
++    if (
++      !userId ||
++      !interfaceConfig?.renewRetentionOnActivity ||
++      interfaceConfig.retentionMode !== RetentionMode.ALL ||
++      interfaceConfig.generalChatRetention === undefined
++    ) {
++      return null;
++    }
++    const Conversation = mongoose.models.Conversation as Model<IConversation>;
++    const expiredAt = createChatExpirationDate(interfaceConfig, false);
++    const renewable = {
++      user: userId,
++      conversationId,
++      isTemporary: { $ne: true },
++      agentEventBinding: { $exists: false },
++      $or: [
++        { expiredAt: null },
++        {
++          expiredAt: {
++            $gt: new Date(),
++            /** Every message of the chat is rewritten, so one write an hour is enough. */
++            $lt: new Date(expiredAt.getTime() - RETENTION_RENEWAL_INTERVAL_MS),
++          },
++        },
++      ],
++    };
++    const stored = await Conversation.findOne(renewable, '_id').lean();
++    if (stored == null) {
++      return null;
++    }
++    const threads = await Conversation.find(
++      { user: userId, 'subagentThread.rootConversationId': conversationId },
++      'conversationId',
++    ).lean();
++    const conversationIds = [conversationId, ...threads.map((thread) => thread.conversationId)];
++    const inChat = { user: userId, conversationId: { $in: conversationIds } };
++    const update = { $set: { expiredAt, isTemporary: false } };
++    /** The chat itself goes last: a failed write leaves it due, so the next turn retries. */
++    await Promise.all([
++      mongoose.models.Message.updateMany({ ...inChat, isTemporary: { $ne: true } }, update, {
++        timestamps: false,
++      }),
++      mongoose.models.ToolCall.updateMany(
++        { ...inChat, expiredAt: { $ne: null } },
++        { $set: { expiredAt } },
++        { timestamps: false },
++      ),
++      mongoose.models.SharedLink.updateMany(
++        { ...inChat, expiredAt: { $ne: null } },
++        { $set: { expiredAt } },
++        { timestamps: false },
++      ),
++      Conversation.updateMany(
++        { user: userId, 'subagentThread.rootConversationId': conversationId },
++        update,
++        { timestamps: false },
++      ),
++    ]);
++    await Conversation.updateOne({ _id: stored._id }, update, { timestamps: false });
++    return expiredAt;
++  }
++
+   /**
+    * Searches for a conversation by conversationId and returns associated file ids.
+    */
+@@ -4587,6 +4664,7 @@ export function createConversationMethods(
+     listActiveSubagentThreadLeases,
+     getConvoOwnership,
+     getConvoRetention,
++    renewConversationRetention,
+     getConvoTitle,
+     markConvoSeen,
+     markConvoUnread,
+-- 
+2.43.0
+
