@@ -2305,6 +2305,7 @@ export const interfaceSchema = z
     temporaryChat: z.boolean().optional(),
     temporaryChatRetention: z.number().min(1).max(8760).optional(),
     generalChatRetention: z.number().min(1).max(8760).optional(),
+    renewRetentionOnActivity: z.boolean().optional(),
     autoSubmitFromUrl: z.boolean().optional(),
     retentionMode: z.nativeEnum(RetentionMode).default(RetentionMode.TEMPORARY),
     retainAgentFiles: z.boolean().optional(),

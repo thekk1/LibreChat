@@ -57,6 +57,7 @@ export async function loadDefaultInterface({
     temporaryChat: interfaceConfig?.temporaryChat,
     temporaryChatRetention: interfaceConfig?.temporaryChatRetention,
     generalChatRetention: interfaceConfig?.generalChatRetention,
+    renewRetentionOnActivity: interfaceConfig?.renewRetentionOnActivity,
     retentionMode: interfaceConfig?.retentionMode,
     retainAgentFiles: interfaceConfig?.retainAgentFiles,
     runCode: interfaceConfig?.runCode,

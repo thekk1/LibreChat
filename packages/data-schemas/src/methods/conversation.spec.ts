@@ -14,6 +14,7 @@ import type {
   IAgentEventActorSuspensionEvidence,
   IChatProject,
   IConversation,
+  IMessage,
   AppConfig,
 } from '../types';
 import { ConversationMethods, createConversationMethods } from './conversation';
@@ -7792,6 +7793,155 @@ describe('Conversation Operations', () => {
       expect(result?.conversations.map((c) => c.conversationId)).toEqual([
         titleMatch.conversationId,
       ]);
+    });
+  });
+
+  describe('renewConversationRetention', () => {
+    const interfaceConfig = {
+      retentionMode: RetentionMode.ALL,
+      generalChatRetention: 2160,
+      renewRetentionOnActivity: true,
+    } as AppConfig['interfaceConfig'];
+    const userId = new mongoose.Types.ObjectId().toString();
+    const inDays = (days: number) => new Date(Date.now() + days * 24 * 60 * 60_000);
+    const expectRenewed = (date?: Date | null) => {
+      expect(date).toBeInstanceOf(Date);
+      expect(Math.abs((date as Date).getTime() - inDays(90).getTime())).toBeLessThan(60_000);
+    };
+
+    const seedChat = async (fields: Partial<IConversation>) => {
+      const conversationId = uuidv4();
+      await Conversation.create({
+        conversationId,
+        user: userId,
+        endpoint: EModelEndpoint.agents,
+        isTemporary: false,
+        ...fields,
+      });
+      await mongoose.models.Message.create({
+        messageId: uuidv4(),
+        conversationId,
+        user: userId,
+        isTemporary: fields.isTemporary ?? false,
+        expiredAt: fields.expiredAt,
+      });
+      return conversationId;
+    };
+    const messageDeadline = async (conversationId: string) =>
+      (await mongoose.models.Message.findOne({ conversationId }).lean<IMessage>())?.expiredAt;
+    const chatDeadline = async (conversationId: string) =>
+      (await Conversation.findOne({ conversationId }).lean<IConversation>())?.expiredAt;
+
+    it('moves the deadline of the chat and its messages', async () => {
+      const conversationId = await seedChat({ expiredAt: inDays(10) });
+      const renewed = await methods.renewConversationRetention(
+        { userId, interfaceConfig },
+        conversationId,
+      );
+      expectRenewed(renewed);
+      expect(await chatDeadline(conversationId)).toEqual(renewed);
+      expect(await messageDeadline(conversationId)).toEqual(renewed);
+    });
+
+    it('moves subagent threads, tool calls and shared links with the chat', async () => {
+      const conversationId = await seedChat({ expiredAt: inDays(10) });
+      const threadId = await seedChat({
+        expiredAt: inDays(10),
+        subagentThread: {
+          rootConversationId: conversationId,
+          parentConversationId: conversationId,
+          parentMessageId: 'message',
+          parentToolCallId: 'tool-call',
+          subagentType: 'research',
+          subagentKind: 'agent',
+          depth: 1,
+        },
+      });
+      await mongoose.models.ToolCall.create({
+        conversationId,
+        messageId: 'message',
+        toolId: 'tool',
+        user: userId,
+        expiredAt: inDays(10),
+      });
+      await mongoose.models.SharedLink.create({
+        conversationId,
+        user: userId,
+        shareId: uuidv4(),
+        expiredAt: inDays(10),
+      });
+      const renewed = await methods.renewConversationRetention(
+        { userId, interfaceConfig },
+        conversationId,
+      );
+      expect(await chatDeadline(threadId)).toEqual(renewed);
+      expect(await messageDeadline(threadId)).toEqual(renewed);
+      const toolCall = await mongoose.models.ToolCall.findOne({ conversationId }).lean<{
+        expiredAt?: Date;
+      }>();
+      expect(toolCall?.expiredAt).toEqual(renewed);
+      const share = await mongoose.models.SharedLink.findOne({ conversationId }).lean<{
+        expiredAt?: Date;
+      }>();
+      expect(share?.expiredAt).toEqual(renewed);
+    });
+
+    it('stamps a chat stored before retention applied, with all its messages', async () => {
+      const conversationId = await seedChat({});
+      const renewed = await methods.renewConversationRetention(
+        { userId, interfaceConfig },
+        conversationId,
+      );
+      expectRenewed(renewed);
+      expect(await messageDeadline(conversationId)).toEqual(renewed);
+    });
+
+    it('does not rewrite a chat renewed within the last hour', async () => {
+      const deadline = inDays(90);
+      const conversationId = await seedChat({ expiredAt: deadline });
+      expect(
+        await methods.renewConversationRetention({ userId, interfaceConfig }, conversationId),
+      ).toBeNull();
+      expect(await chatDeadline(conversationId)).toEqual(deadline);
+    });
+
+    it.each([
+      ['the switch is off', { ...interfaceConfig, renewRetentionOnActivity: false }],
+      ['retention covers temporary chats only', { ...interfaceConfig, retentionMode: undefined }],
+      ['no general retention is set', { ...interfaceConfig, generalChatRetention: undefined }],
+    ])('leaves the deadline alone when %s', async (_name, config) => {
+      const deadline = inDays(10);
+      const conversationId = await seedChat({ expiredAt: deadline });
+      expect(
+        await methods.renewConversationRetention(
+          { userId, interfaceConfig: config as AppConfig['interfaceConfig'] },
+          conversationId,
+        ),
+      ).toBeNull();
+      expect(await chatDeadline(conversationId)).toEqual(deadline);
+    });
+
+    it.each([
+      ['temporary', { isTemporary: true, expiredAt: inDays(10) }],
+      ['already expired', { expiredAt: inDays(-1) }],
+    ])('does not renew a chat that is %s', async (_name, fields) => {
+      const conversationId = await seedChat(fields);
+      expect(
+        await methods.renewConversationRetention({ userId, interfaceConfig }, conversationId),
+      ).toBeNull();
+      expect(await chatDeadline(conversationId)).toEqual(fields.expiredAt);
+    });
+
+    it("does not touch another user's chat", async () => {
+      const deadline = inDays(10);
+      const conversationId = await seedChat({ expiredAt: deadline });
+      expect(
+        await methods.renewConversationRetention(
+          { userId: new mongoose.Types.ObjectId().toString(), interfaceConfig },
+          conversationId,
+        ),
+      ).toBeNull();
+      expect(await chatDeadline(conversationId)).toEqual(deadline);
     });
   });
 });
