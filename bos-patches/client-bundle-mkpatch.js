@@ -12,6 +12,7 @@
 //   Presets mit Agent (MCPSelect nur mit showEphemeralBadges), deshalb eine eigene Komponente neben dem Menue.
 //   Dieselbe Komponente zeigt diese Links und den Login-Flow-Link von Nextcloud als Knopf und laesst im
 //   Preset-Menue Zeilenumbrueche der Beschreibung (SpecDescription) gelten.
+//   Dazu faellt auf der Startseite eines Chats die Zeile "Kontakt:" (AgentContact) unter der Beschreibung weg.
 // sw.js gibt jedem geaenderten Chunk eine Revision, sonst liefert der Service Worker den alten aus.
 // Aufruf: docker run --rm -v "$PWD/patches/client-bundle:/out" --entrypoint node \
 //           ghcr.io/librechat-ai/librechat:v0.8.8 /out/mkpatch.js /out
@@ -19,7 +20,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-9';
+const REVISION = 'bos-10';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -49,10 +50,12 @@ const MCP_DIALOG = 'function bosMcpDialog(){let{conversationId:e,storageContextK
   + 'i&&(0,$.jsx)(RD,{...i,conversationId:e,storageContextKey:t})]})}';
 
 const chunks = {
-  'index.CSEwt3Fy.js': (js) => swap(swap(js,
+  'index.CSEwt3Fy.js': (js) => swap(swap(swap(js,
     'function eO(){let{selectableServers:e}=ud()?.mcpServerManager', `${MCP_DIALOG}function eO(){let{selectableServers:e}=ud()?.mcpServerManager`),
     'className:`relative flex flex-wrap items-center gap-2`,children:[e===!0&&(0,$.jsx)(HD,{}),',
     'className:`relative flex flex-wrap items-center gap-2`,children:[(0,$.jsx)(bosMcpDialog,{}),e===!0&&(0,$.jsx)(HD,{}),'),
+    ',E&&!c&&(0,$.jsx)(Rb,{agent:E,className:`animate-fadeIn mt-2 max-w-md justify-center text-center text-sm`})]',
+    ']'),
   'MyFilesModal.D-V6_fYt.js': (js) => swap(js,
     'getPaginationRowModel:x(),onRowSelectionChange:l,',
     'getPaginationRowModel:x(),initialState:{pagination:{pageIndex:0,pageSize:100}},onRowSelectionChange:l,'),
