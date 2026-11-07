@@ -7,6 +7,9 @@
 // - markdown: Links in Markdown-Artefakten in einem neuen Tab; ohne target oeffnet der Klick im iframe der Vorschau.
 // - hooks (MarkdownImage): ![Name](/images/....mp4) als Videospieler statt <img>, fuer Videos, die
 //   tool-files in die Antwort setzt.
+//   Bilder und Videos von einem anderen Server als LibreChat laedt erst ein Klick auf einen Platzhalter
+//   ("Bild von <Host> laden"): sonst holt der Browser sie beim Anzeigen der Antwort, und eine Adresse mit
+//   Daten aus dem Chat, die eine Webseite dem Modell untergeschoben hat, ginge ohne Klick hinaus.
 // - index (BadgeRow): ein Klick auf einen Link zu /mcp-zugang/ oeffnet den Zugangsdaten-Dialog von LibreChat
 //   (MCPConfigDialog) im Chat statt des Formulars in einem neuen Tab. Das Menue mit diesem Dialog fehlt bei
 //   Presets mit Agent (MCPSelect nur mit showEphemeralBadges), deshalb eine eigene Komponente neben dem Menue.
@@ -20,7 +23,7 @@ const fs = require('fs');
 const zlib = require('zlib');
 const dist = '/app/client/dist';
 const out = process.argv[2];
-const REVISION = 'bos-10';
+const REVISION = 'bos-11';
 
 const swap = (text, from, to, count = 1) => {
   const found = text.split(from).length - 1;
@@ -67,9 +70,11 @@ const chunks = {
   'markdown.N65uYq6U.js': (js) => swap(js,
     '}\\`);\n}\n<\\/script>',
     '}\\`);\ndocument.getElementById(\'content\').querySelectorAll(\'a\').forEach(function(a){a.target=\'_blank\';a.rel=\'noopener noreferrer\'});\n}\n<\\/script>'),
-  'hooks.B1NLB7i6.js': (js) => swap(js,
+  'hooks.B1NLB7i6.js': (js) => swap(swap(js,
+    'var m8=(0,q.memo)(function({src:e,alt:t,title:n,className:r,style:i}){',
+    'function bosExternal(s){if(!s||/^(data|blob):/i.test(s))return!1;try{let u=new URL(s,location.href);return/^https?:$/.test(u.protocol)&&u.origin!==location.origin}catch{return!1}}var bosExtImg=(0,q.memo)(function({src:e,alt:t,title:n,className:r,style:i}){let[a,o]=(0,q.useState)(!1),h=new URL(e,location.href).host,v=/\\.(mp4|m4v|webm|mov|ogv)([?#]|$)/i.test(e);if(a)return v?(0,J.jsx)(`video`,{src:e,controls:!0,preload:`metadata`,title:t||n,className:r,style:{maxWidth:`100%`,...i}}):(0,J.jsx)(`img`,{src:e,alt:t,title:n,className:r,style:i});return(0,J.jsx)(`button`,{type:`button`,title:e,onClick:c=>{c.preventDefault(),c.stopPropagation(),o(!0)},className:`my-1 inline-block max-w-full break-all rounded-lg border border-border-medium px-3 py-1.5 text-left text-sm text-text-secondary hover:bg-surface-hover`,children:`${v?`Video`:`Bild`} von ${h} laden${t?` \u2013 ${t}`:``}`})});var m8=(0,q.memo)(function({src:e,alt:t,title:n,className:r,style:i}){'),
     'return(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`',
-    'return/\\.(mp4|m4v|webm|mov|ogv)([?#]|$)/i.test(s??``)?(0,J.jsx)(`video`,{src:s,controls:!0,preload:`metadata`,title:t||n,className:r,style:{maxWidth:`100%`,...i}}):(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`'),
+    'if(bosExternal(s))return(0,J.jsx)(bosExtImg,{src:s,alt:t,title:n,className:r,style:i});return/\\.(mp4|m4v|webm|mov|ogv)([?#]|$)/i.test(s??``)?(0,J.jsx)(`video`,{src:s,controls:!0,preload:`metadata`,title:t||n,className:r,style:{maxWidth:`100%`,...i}}):(0,J.jsx)(`img`,{src:s,alt:t,title:n,className:r,style:i})});m8.displayName=`MarkdownImage`'),
 };
 
 let sw = fs.readFileSync(`${dist}/sw.js`, 'utf8');
