@@ -77,6 +77,57 @@ const {
   invalidateCachedTools,
 } = require('./Config');
 const { getLogStores } = require('~/cache');
+
+/**
+ * BOS-Patch tool-budget: hoechstens N Aufrufe je Subagenten-Lauf fuer die MCP-Server aus
+ * BOS_TOOL_BUDGET (z. B. "browse:5"). Danach liefert jedes Werkzeug des Servers nur noch die
+ * Aufforderung, mit dem Gelesenen zu antworten; so endet der Lauf, statt am recursion_limit
+ * abzubrechen und alles Gelesene zu verlieren. Der Lauf ist die subagentRunId aus dem
+ * executionContext des Subagenten, sonst die run_id des Aufrufs.
+ */
+const bosToolBudgets = new Map(
+  (process.env.BOS_TOOL_BUDGET || '')
+    .split(',')
+    .map((entry) => entry.trim().split(':'))
+    .filter(([server, limit]) => server && Number(limit) > 0)
+    .map(([server, limit]) => [server, Number(limit)]),
+);
+const bosToolBudgetCounts = new Map();
+function bosToolBudgetExceeded(serverName, config) {
+  const limit = bosToolBudgets.get(serverName);
+  if (!limit) {
+    return null;
+  }
+  const ancestry = config?.configurable?.executionContext?.ancestry;
+  const runKey =
+    (Array.isArray(ancestry) && ancestry.length > 0
+      ? ancestry[ancestry.length - 1]?.subagentRunId
+      : undefined) ??
+    config?.metadata?.run_id ??
+    config?.configurable?.run_id;
+  if (!runKey) {
+    return null;
+  }
+  const now = Date.now();
+  for (const [oldKey, old] of bosToolBudgetCounts) {
+    if (now - old.at > 3600000) {
+      bosToolBudgetCounts.delete(oldKey);
+    }
+  }
+  const key = `${serverName}:${runKey}`;
+  const entry = bosToolBudgetCounts.get(key) ?? { count: 0, at: now };
+  entry.count += 1;
+  entry.at = now;
+  bosToolBudgetCounts.set(key, entry);
+  if (entry.count <= limit) {
+    return null;
+  }
+  logger.info(`[tool-budget] ${serverName}: call ${entry.count} over budget ${limit} (run ${runKey})`);
+  return (
+    `Tool budget exhausted: this task allows at most ${limit} calls of these tools and all are used. ` +
+    'Do not call any more tools. Answer now with what you have read so far, and say what is missing.'
+  );
+}
 const {
   clearMCPAuthorizationFenceRetry,
   persistMCPAuthorizationFenceRetry,
@@ -1260,6 +1311,10 @@ function createToolInstance({
 
   /** @type {(toolArguments: Object | string, config?: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolArguments, config) => {
+    const bosBudgetNote = bosToolBudgetExceeded(serverName, config);
+    if (bosBudgetNote) {
+      return [bosBudgetNote, null];
+    }
     const effectiveUser = config?.configurable?.user ?? capturedUser;
     const permissionUser = effectiveUser;
     /** @type {string | undefined} */
