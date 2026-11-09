@@ -79,32 +79,45 @@ const {
 const { getLogStores } = require('~/cache');
 
 /**
- * BOS-Patch tool-budget: hoechstens N Aufrufe je Subagenten-Lauf fuer die MCP-Server aus
- * BOS_TOOL_BUDGET (z. B. "browse:5"). Danach liefert jedes Werkzeug des Servers nur noch die
- * Aufforderung, mit dem Gelesenen zu antworten; so endet der Lauf, statt am recursion_limit
- * abzubrechen und alles Gelesene zu verlieren. Der Lauf ist die subagentRunId aus dem
- * executionContext des Subagenten, sonst die run_id des Aufrufs.
+ * BOS-Patch tool-budget: begrenzt die Aufrufe der Werkzeuge eines MCP-Servers. BOS_TOOL_BUDGET nennt je
+ * Server die Grenze je Subagenten-Lauf und optional die Grenze je Benutzernachricht ueber alle Laeufe
+ * ("browse:5:10", mehrere durch Komma). Danach liefert jedes Werkzeug des Servers nur noch die
+ * Aufforderung, mit dem Gelesenen zu antworten; so endet der Lauf, statt am recursion_limit abzubrechen
+ * und alles Gelesene zu verlieren. Der Lauf ist die subagentRunId aus dem executionContext des
+ * Subagenten, sonst die run_id; die Nachricht ist die rootRunId, sonst ebenfalls die run_id. Zur Grenze
+ * je Nachricht zaehlen nur Aufrufe, die die Grenze je Lauf durchlaesst.
  */
 const bosToolBudgets = new Map(
   (process.env.BOS_TOOL_BUDGET || '')
     .split(',')
     .map((entry) => entry.trim().split(':'))
     .filter(([server, limit]) => server && Number(limit) > 0)
-    .map(([server, limit]) => [server, Number(limit)]),
+    .map(([server, limit, total]) => [
+      server,
+      { limit: Number(limit), total: Number(total) > 0 ? Number(total) : 0 },
+    ]),
 );
 const bosToolBudgetCounts = new Map();
+function bosToolBudgetCount(key, now) {
+  const entry = bosToolBudgetCounts.get(key) ?? { count: 0, at: now };
+  entry.count += 1;
+  entry.at = now;
+  bosToolBudgetCounts.set(key, entry);
+  return entry.count;
+}
 function bosToolBudgetExceeded(serverName, config) {
-  const limit = bosToolBudgets.get(serverName);
-  if (!limit) {
+  const budget = bosToolBudgets.get(serverName);
+  if (!budget) {
     return null;
   }
-  const ancestry = config?.configurable?.executionContext?.ancestry;
+  const executionContext = config?.configurable?.executionContext;
+  const ancestry = executionContext?.ancestry;
+  const fallbackKey = config?.metadata?.run_id ?? config?.configurable?.run_id;
   const runKey =
     (Array.isArray(ancestry) && ancestry.length > 0
       ? ancestry[ancestry.length - 1]?.subagentRunId
-      : undefined) ??
-    config?.metadata?.run_id ??
-    config?.configurable?.run_id;
+      : undefined) ?? fallbackKey;
+  const rootKey = executionContext?.rootRunId ?? fallbackKey;
   if (!runKey) {
     return null;
   }
@@ -114,19 +127,27 @@ function bosToolBudgetExceeded(serverName, config) {
       bosToolBudgetCounts.delete(oldKey);
     }
   }
-  const key = `${serverName}:${runKey}`;
-  const entry = bosToolBudgetCounts.get(key) ?? { count: 0, at: now };
-  entry.count += 1;
-  entry.at = now;
-  bosToolBudgetCounts.set(key, entry);
-  if (entry.count <= limit) {
-    return null;
+  const runCount = bosToolBudgetCount(`${serverName}:run:${runKey}`, now);
+  if (runCount > budget.limit) {
+    logger.info(`[tool-budget] ${serverName}: call ${runCount} over budget ${budget.limit} (run ${runKey})`);
+    return (
+      `Tool budget exhausted: this task allows at most ${budget.limit} calls of these tools and all are used. ` +
+      'Do not call any more tools. Answer now with what you have read so far, and say what is missing.'
+    );
   }
-  logger.info(`[tool-budget] ${serverName}: call ${entry.count} over budget ${limit} (run ${runKey})`);
-  return (
-    `Tool budget exhausted: this task allows at most ${limit} calls of these tools and all are used. ` +
-    'Do not call any more tools. Answer now with what you have read so far, and say what is missing.'
-  );
+  const rootCount =
+    budget.total > 0 && rootKey ? bosToolBudgetCount(`${serverName}:root:${rootKey}`, now) : 0;
+  if (budget.total > 0 && rootCount > budget.total) {
+    logger.info(
+      `[tool-budget] ${serverName}: call ${rootCount} over budget ${budget.total} per message (run ${runKey})`,
+    );
+    return (
+      `Tool budget exhausted: this question allows at most ${budget.total} calls of these tools across all ` +
+      'requests, and all are used. Do not call any more tools. Answer now with what you have read so far, ' +
+      'and say what is missing.'
+    );
+  }
+  return null;
 }
 const {
   clearMCPAuthorizationFenceRetry,
