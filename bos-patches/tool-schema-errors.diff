@@ -9,3 +9,14 @@
  	get lc_namespace() {
  		return ["langchain", "tools"];
  	}
+@@ -118,6 +118,10 @@
+ 			if (!result.valid) {
+ 				let message = `Received tool input did not match expected schema`;
+ 				if (this.verboseParsingErrors) message = `${message}\nDetails: ${result.errors.map((e) => `${e.keywordLocation}: ${e.error}`).join("\n")}`;
++				/** BOS: unbekannte Argumente nennen; sonst sieht das Modell nur das fehlende Pflichtfeld. */
++				const declared = this.schema && typeof this.schema.properties === "object" ? Object.keys(this.schema.properties) : [];
++				const undeclared = declared.length > 0 && inputForValidation && typeof inputForValidation === "object" && !Array.isArray(inputForValidation) ? Object.keys(inputForValidation).filter((key) => !declared.includes(key)) : [];
++				if (this.verboseParsingErrors && undeclared.length > 0) message = `${message}\nUndeclared argument(s): ${undeclared.slice(0, 8).join(", ")}. Declared arguments: ${declared.slice(0, 16).join(", ")}. Put each value under a declared argument.`;
+ 				throw new require_utils.ToolInputParsingException(message, JSON.stringify(arg));
+ 			}
+ 			parsed = inputForValidation;

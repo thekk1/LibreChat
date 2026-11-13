@@ -1,6 +1,6 @@
 --- a/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
 +++ b/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
-@@ -42,9 +42,31 @@
+@@ -42,9 +42,32 @@
  	description: SubagentToolDescription,
  	parameters: SubagentToolSchema
  };
@@ -29,12 +29,13 @@
 +	const { toAlias } = bosSubagentAliases(configs);
 +	const types = configs.map((c) => toAlias.get(String(c.type)) ?? c.type);
 +	const typeDescriptions = configs.map((c) => `- "${toAlias.get(String(c.type)) ?? c.type}" (${c.name}): ${c.description}`).join("\n");
-+	/** IDs bleiben gueltig: aeltere Aufrufe im Verlauf nennen sie. Angeboten werden nur die Kurznamen. */
-+	const accepted = [...types, ...configs.map((c) => c.type).filter((type) => !types.includes(type))];
++	/** BOS: Nur die Kurznamen stehen im Schema. Mit den IDs in der Liste schrieb das Modell sie als Namen
++	 *  eines Arguments (agent_...: "<Auftrag>") statt description. Der SubagentExecutor nimmt IDs weiter an. */
++	const accepted = types;
  	return {
  		name: SubagentToolName,
  		schema: {
-@@ -57,7 +79,7 @@
+@@ -57,7 +80,7 @@
  				},
  				subagent_type: {
  					type: "string",
@@ -43,7 +44,7 @@
  					description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(", ")}.`
  				},
  				...options.background === true ? { run_in_background: {
-@@ -87,6 +109,7 @@
+@@ -87,6 +110,7 @@
  exports.SubagentToolDescription = SubagentToolDescription;
  exports.SubagentToolName = SubagentToolName;
  exports.SubagentToolSchema = SubagentToolSchema;

@@ -1,0 +1,23 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -99658,7 +99658,20 @@
+ 	};
+ }
+ const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
++/** BOS-Patch subagent-round-guard: Ab diesem Schritt des Graphen (metadata.langgraph_step) fuehrt ein Subagent
++*  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
++*  regulaer, statt mit "Recursion limit reached" abzubrechen und alles Gelesene zu verlieren. 0 = aus. */
++const BOS_SUBAGENT_STEP_GUARD = Number(process.env.BOS_SUBAGENT_STEP_GUARD) || 0;
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
++	const bosStep = metadata?.langgraph_step;
++	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
++		_librechat_data_schemas.logger.debug(`[round-guard] subagent step ${bosStep}, ${toolCalls.length} call(s)`);
++		if (bosStep >= BOS_SUBAGENT_STEP_GUARD) {
++			_librechat_data_schemas.logger.info(`[round-guard] subagent step ${bosStep} over ${BOS_SUBAGENT_STEP_GUARD}: ${toolCalls.length} call(s) not run`);
++			for (const tc of toolCalls) blocked.set(tc, errorResult(tc, "Round limit reached: this task has used almost all of its rounds; nothing was run. Do not call any more tools. Answer now with what you have read so far, and say what is missing."));
++			return;
++		}
++	}
+ 	const user = resolveBackgroundUserId(configurable);
+ 	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
+ 	for (const tc of toolCalls) {

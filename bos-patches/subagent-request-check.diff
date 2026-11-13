@@ -1,0 +1,13 @@
+--- a/node_modules/@librechat/agents/dist/cjs/graphs/Graph.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/graphs/Graph.cjs
+@@ -2252,6 +2252,10 @@
+ 				const subagentTool = (0, _langchain_core_tools.tool)(async (rawInput, config) => {
+ 					const input = rawInput;
+ 					const description = typeof input.description === "string" && input.description.trim().length > 0 ? input.description : require_SubagentExecutor.DEFAULT_SUBAGENT_DESCRIPTION;
++					/** BOS-Patch subagent-request-check: Ein Auftrag kuerzer als intent ist fast immer unvollstaendig (das Modell
++					*  schrieb den Auftrag in intent und nur ein Stichwort in description); der Subagent sieht intent nicht. */
++					const bosIntent = typeof input.intent === "string" ? input.intent.trim() : "";
++					if (bosIntent.length > 0 && description.trim().length < bosIntent.length) return "Subagent error: description is shorter than intent; nothing was run. The subagent receives only description, never intent or this chat. Write the complete request into description (every key, file or {{data:...}} reference, the period and exactly what to return) and keep intent a short status line.";
+ 					const subagentType = typeof input.subagent_type === "string" ? input.subagent_type : "";
+ 					const subagentThreadId = typeof input.subagent_thread_id === "string" && input.subagent_thread_id.trim() !== "" ? input.subagent_thread_id.trim() : void 0;
+ 					const threadId = config.configurable?.thread_id;
