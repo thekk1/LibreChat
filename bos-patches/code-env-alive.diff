@@ -1,0 +1,51 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -65063,12 +65063,29 @@
+ 	* @param {object} [params.req] - Request used to mint JWT code auth, when enabled
+ 	* @returns {Promise<boolean>} true if the file is still accessible in the code env
+ 	*/
++	/** BOS-Patch code-env-alive: Der Dateiserver der Code-API (codeapi 1.10.13) listet bei detail=summary nur
++	*  name, size, lastModified und etag, kein fileId. Der Name lautet <session>/.codeapi-objects/<base64url(fileId)>,
++	*  bei aelteren Objekten <session>/<fileId> mit Endung. Ohne den Vergleich ueber den Namen gilt jede gepruefte
++	*  Datei als abgelaufen, und LibreChat laedt alle Dateien des Chats bei jedem Werkzeugstart neu hoch. */
++	function bosRemoteHasFile(remoteFiles, sessionId, fileId) {
++		if (!Array.isArray(remoteFiles) || !sessionId || !fileId) return false;
++		const objectName = `${sessionId}/.codeapi-objects/${Buffer.from(String(fileId), "utf8").toString("base64url")}`;
++		return remoteFiles.some((f) => {
++			if (f == null) return false;
++			if (f.fileId === fileId) return true;
++			const name = typeof f === "string" ? f : f.name;
++			if (typeof name !== "string") return false;
++			if (name === objectName) return true;
++			const rest = name.startsWith(`${sessionId}/`) ? name.slice(sessionId.length + 1) : "";
++			return rest !== "" && !rest.includes("/") && rest.replace(/\.[^.]+$/, "") === fileId;
++		});
++	}
+ 	async function checkCodeEnvFileAlive({ file, apiKey, req }) {
+ 		const ref = file.metadata?.codeEnvRef;
+ 		if (!ref?.storage_session_id || !ref?.file_id) return false;
+ 		try {
+ 			const baseURL = (0, _librechat_agents.getCodeBaseURL)();
+-			return !!(await getAxios()({
++			return bosRemoteHasFile((await getAxios()({
+ 				method: "get",
+ 				url: `${baseURL}/files/${ref.storage_session_id}`,
+ 				params: { detail: "summary" },
+@@ -65079,7 +65096,7 @@
+ 				httpAgent: codeServerHttpAgent,
+ 				httpsAgent: codeServerHttpsAgent,
+ 				timeout: 5e3
+-			})).data?.some((f) => f.fileId === ref.file_id);
++			})).data, ref.storage_session_id, ref.file_id);
+ 		} catch (error) {
+ 			logAxiosError({
+ 				message: `[checkCodeEnvFileAlive] Error checking file "${file.filename}": ${error.message}`,
+@@ -65163,7 +65180,7 @@
+ 					httpsAgent: codeServerHttpsAgent,
+ 					timeout: 5e3
+ 				})).data ?? [];
+-				for (const { file_id, remoteFileId } of fileEntries) if (remoteFiles.some((f) => f.fileId === remoteFileId)) aliveFileIds.add(file_id);
++				for (const { file_id, remoteFileId } of fileEntries) if (bosRemoteHasFile(remoteFiles, session_id, remoteFileId)) aliveFileIds.add(file_id);
+ 			} catch (error) {
+ 				logAxiosError({
+ 					message: `[checkSessionsAlive] Error checking session "${session_id}": ${error.message}`,
