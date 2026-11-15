@@ -138,6 +138,50 @@ function splitRows(lines, before) {
 	const names = columnNames(header?.length === width ? header : null, width);
 	return cells.map((row) => Object.fromEntries(names.map((name, index) => [name, cell(row[index])])));
 }
+const TRAILING_URL = /\s+[-–]\s+(https?:\/\/\S+)\s*$/;
+const TRAILING_GROUP = /\s*\(([^()]*)\)\s*$/;
+const FIELD_START = /,\s+(?=[\p{L}_][\p{L}\d_.-]*:(?:\s|$))/u;
+const FIELD = /^\s*([\p{L}_][\p{L}\d_.-]*):(?:\s+([\s\S]*?)|\s*)\s*$/u;
+const LINE_COLUMNS = ["id", "title", "url"];
+/** "ID: Text (feld: wert, feld: wert) - URL" zerlegt, sonst null. Ein Doppelpunkt ohne Leerzeichen
+ *  danach ("Datei.java:60") ist kein Feld. */
+function lineFields(body) {
+	let rest = body;
+	let url = null;
+	const urlMatch = rest.match(TRAILING_URL);
+	if (urlMatch) {
+		url = urlMatch[1];
+		rest = rest.slice(0, urlMatch.index);
+	}
+	const fields = [];
+	const group = rest.match(TRAILING_GROUP);
+	if (group) {
+		const parts = group[1].split(FIELD_START).map((part) => part.match(FIELD));
+		if (parts.every(Boolean)) {
+			for (const [, name, value] of parts) fields.push([name, value ?? ""]);
+			rest = rest.slice(0, group.index);
+		}
+	}
+	if (url === null && fields.length === 0) return null;
+	const id = rest.trim().split(/\s+/)[0];
+	const row = {
+		id: id.replace(/^[#"'`]+|[:,;"'`]+$/g, ""),
+		title: rest.trim().slice(id.length).replace(/^\s*[-–:]?\s*/, "")
+	};
+	for (const [name, value] of fields) {
+		if (LINE_COLUMNS.includes(name) || name in row) return null;
+		row[name] = cell(value.trim());
+	}
+	if (url !== null) row.url = url;
+	return row;
+}
+/** Zeilen einer Folge als Spalten, wenn alle Zeilen dieselben Felder in derselben Reihenfolge haben. */
+function fieldRows(bodies) {
+	const rows = bodies.map(lineFields);
+	if (rows.some((row) => row === null)) return null;
+	const shape = Object.keys(rows[0]).join("\n");
+	return rows.every((row) => Object.keys(row).join("\n") === shape) ? rows : null;
+}
 /** Textergebnisse: Folgen gleich aufgebauter Zeilen, etwa "- #123: ..." von Trac oder eine Tabelle aus Code. */
 function textLists(text) {
 	const found = [];
@@ -149,13 +193,13 @@ function textLists(text) {
 		const before = lines.slice(Math.max(0, runStart - 2), runStart);
 		const split = run.length >= MIN_ROWS ? splitRows(run, before) : null;
 		if (split && split.length >= MIN_ROWS) found.push({ field: "table", rows: split });
-		else if (run.length >= MIN_ROWS) found.push({
-			field: "lines",
-			rows: run.map((line) => {
-				const body = line.replace(/^\s*([-*•]|\d+[.)]|\|)\s+/, "").trim();
-				return { id: body.split(/\s+/)[0].replace(/^[#"'`]+|[:,;"'`]+$/g, ""), line: body };
-			})
-		});
+		else if (run.length >= MIN_ROWS) {
+			const bodies = run.map((line) => line.replace(/^\s*([-*•]|\d+[.)]|\|)\s+/, "").trim());
+			found.push({
+				field: "lines",
+				rows: fieldRows(bodies) ?? bodies.map((body) => ({ id: body.split(/\s+/)[0].replace(/^[#"'`]+|[:,;"'`]+$/g, ""), line: body }))
+			});
+		}
 		run = [];
 	};
 	lines.forEach((line, index) => {
