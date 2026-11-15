@@ -282,24 +282,33 @@ function stripTyped(content, set) {
 	if (values.size < MIN_ROWS) return content;
 	const needed = Math.ceil(set.rows.length * TYPED_SHARE);
 	const lines = content.split("\n");
-	const hits = lines.map((line) => [...line.matchAll(TOKEN)].filter((match) => values.has(match[0])));
+	// Ein Satzzeichen am Wortende gehoert nicht zum Wert ("..., ABC-12.").
+	const word = (match) => ({ index: match.index, text: match[0].replace(/[.!?]+$/, "") });
+	const hits = lines.map((line) => [...line.matchAll(TOKEN)].map(word).filter((hit) => values.has(hit.text)));
 	const separator = (line) => line.trim() === "" || /^\s*\|?[\s:|-]+\|?\s*$/.test(line);
+	const structured = (line) => /^\s*([-*•|]|\d+[.)])/.test(line);
 	for (let start = 0; start < lines.length; start++) {
 		if (hits[start].length === 0) continue;
 		let end = start;
+		let blank = false;
 		for (let next = start + 1; next < lines.length; next++) {
-			if (hits[next].length > 0) end = next;
-			else if (!separator(lines[next])) break;
+			if (hits[next].length > 0) {
+				// Nach einer Leerzeile beginnt mit dem Wechsel zwischen Tabelle/Liste und Fliesstext ein neuer
+				// Block: die Zeile "Fehlend: A, B." unter einer Tabelle ist eine Teilmenge und bleibt stehen.
+				if (blank && structured(lines[next]) !== structured(lines[end])) break;
+				end = next;
+				blank = false;
+			} else if (!separator(lines[next])) break;
+			else if (lines[next].trim() === "") blank = true;
 		}
 		const distinct = new Set();
-		for (let index = start; index <= end; index++) for (const match of hits[index]) distinct.add(match[0]);
+		for (let index = start; index <= end; index++) for (const hit of hits[index]) distinct.add(hit.text);
 		if (distinct.size >= needed) {
-			const structured = (line) => /^\s*([-*•|]|\d+[.)])/.test(line);
 			const first = hits[start][0];
 			const lastHits = hits[end];
 			const last = lastHits[lastHits.length - 1];
 			const before = structured(lines[start]) ? "" : lines[start].slice(0, first.index);
-			const after = structured(lines[end]) ? "" : lines[end].slice(last.index + last[0].length);
+			const after = structured(lines[end]) ? "" : lines[end].slice(last.index + last.text.length);
 			const note = `${before}[${distinct.size} rows, see ${set.id}]${after}`;
 			lines.splice(start, end - start + 1, note);
 			hits.splice(start, end - start + 1, []);
@@ -480,9 +489,20 @@ function structuredCell(value) {
 		return value;
 	}
 }
+/** Eine Liste von Objekten nennt zu jeder Spalte, die im Antworttext ein Link wird, das Ziel im Feld
+ *  <Spalte>_url. Sonst kennt Code die Adresse eines Tickets nicht und laesst den Link weg oder baut ihn selbst. */
 function fileForCode(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
-	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, structuredCell(row[name] ?? null)])));
+	const single = columns.length === 1 && wanted.length === 1;
+	const links = single ? [] : linkedColumns(set).filter((name) => columns.includes(name) && !set.columns.includes(`${name}_url`));
+	const target = (name, row) => {
+		const url = String(row[name] ?? "") === "" ? null : linkOf(set, name, row);
+		return url && /^https?:\/\/[^\s()]+$/.test(url) ? url : null;
+	};
+	const rows = single ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => ({
+		...Object.fromEntries(columns.map((name) => [name, structuredCell(row[name] ?? null)])),
+		...Object.fromEntries(links.map((name) => [`${name}_url`, target(name, row)]))
+	}));
 	return {
 		name: `${[set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80)}.json`,
 		content: JSON.stringify(rows, null, 1)

@@ -50,7 +50,7 @@
  			blocked.set(tc, errorResult(tc, "Data references could not be resolved; nothing was run. Try again later."));
 --- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs
 +++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs
-@@ -464,15 +464,48 @@
+@@ -473,15 +473,59 @@
  	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, mapStrings(item, replace)]));
  	return value;
  }
@@ -70,9 +70,20 @@
 +		return value;
 +	}
 +}
++/** Eine Liste von Objekten nennt zu jeder Spalte, die im Antworttext ein Link wird, das Ziel im Feld
++ *  <Spalte>_url. Sonst kennt Code die Adresse eines Tickets nicht und laesst den Link weg oder baut ihn selbst. */
 +function fileForCode(set, wanted) {
 +	const columns = wanted.length > 0 ? wanted : set.columns;
-+	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, structuredCell(row[name] ?? null)])));
++	const single = columns.length === 1 && wanted.length === 1;
++	const links = single ? [] : linkedColumns(set).filter((name) => columns.includes(name) && !set.columns.includes(`${name}_url`));
++	const target = (name, row) => {
++		const url = String(row[name] ?? "") === "" ? null : linkOf(set, name, row);
++		return url && /^https?:\/\/[^\s()]+$/.test(url) ? url : null;
++	};
++	const rows = single ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => ({
++		...Object.fromEntries(columns.map((name) => [name, structuredCell(row[name] ?? null)])),
++		...Object.fromEntries(links.map((name) => [`${name}_url`, target(name, row)]))
++	}));
 +	return {
 +		name: `${[set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80)}.json`,
 +		content: JSON.stringify(rows, null, 1)
