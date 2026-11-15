@@ -464,15 +464,36 @@ function mapStrings(value, replace) {
 	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, mapStrings(item, replace)]));
 	return value;
 }
+/** BOS-Patch code-data-file: In der Codeausfuehrung wird ein Verweis zur JSON-Datei unter /mnt/data,
+ *  {{data:D-...:spalte}} als Liste der Werte, sonst als Liste von Objekten. Eingesetzter Text muesste in
+ *  Python- oder Shell-Strings richtig maskiert sein; ein \" in einem Wert wurde dort zu " und das JSON
+ *  ungueltig. */
+function fileForCode(set, wanted) {
+	const columns = wanted.length > 0 ? wanted : set.columns;
+	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => row[columns[0]] ?? null) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? null])));
+	return {
+		name: `${[set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80)}.json`,
+		content: JSON.stringify(rows, null, 1)
+	};
+}
 /** Setzt Verweise in die Argumente eines Werkzeugaufrufs ein, bevor das Werkzeug laeuft.
- *  So laufen Listen aus Griffen nie durch ein Modell. */
-async function expandArgs(args, scope) {
+ *  So laufen Listen aus Griffen nie durch ein Modell. Mit upload (Codeausfuehrung) wird jeder Verweis
+ *  als Datei hochgeladen und zu ihrem Pfad. */
+async function expandArgs(args, scope, upload) {
 	const texts = stringsOf(args).filter((text) => text.includes("{{data:"));
-	if (texts.length === 0) return { args, unknown: [] };
+	if (texts.length === 0) return { args, unknown: [], codeFiles: [] };
 	const { found, unknown } = await lookupRefs(texts, scope);
-	if (unknown.length > 0) return { args, unknown };
-	const replace = (text) => text.replace(REF_PATTERN, (ref) => formatForTool(found.get(ref).set, found.get(ref).wanted));
-	return { args: mapStrings(args, replace), unknown };
+	if (unknown.length > 0) return { args, unknown, codeFiles: [] };
+	const codeFiles = [];
+	const paths = new Map();
+	if (upload) for (const [ref, { set, wanted }] of found) {
+		const file = fileForCode(set, wanted);
+		const codeFile = await upload(file);
+		codeFiles.push(codeFile);
+		paths.set(ref, `/mnt/data/${codeFile.name}`);
+	}
+	const replace = (text) => text.replace(REF_PATTERN, (ref) => paths.get(ref) ?? formatForTool(found.get(ref).set, found.get(ref).wanted));
+	return { args: mapStrings(args, replace), unknown, codeFiles };
 }
 /** Die juengsten Mengen der Chats, ohne ihre Zeilen zu laden. */
 async function recentSets({ user, conversationIds }, exclude) {

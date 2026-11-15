@@ -1,0 +1,95 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -99674,6 +99674,21 @@
+ 		};
+ 	};
+ }
++/** BOS-Patch code-data-file: laedt die Zeilen eines {{data:...}} als JSON-Datei in die Sandbox. */
++function bosCodeDataUploader(configurable, user) {
++	const upload = bosCodeUploader(configurable, user);
++	return async ({ name, content }) => {
++		const fs = require("fs");
++		const dir = await fs.promises.mkdtemp(require("path").join(require("os").tmpdir(), "bos-data-"));
++		const diskPath = require("path").join(dir, name);
++		try {
++			await fs.promises.writeFile(diskPath, content);
++			return await upload({ diskPath, name });
++		} finally {
++			await fs.promises.rm(dir, { recursive: true, force: true });
++		}
++	};
++}
+ const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
+ /** BOS-Patch subagent-round-guard: Ab diesem Schritt des Graphen (metadata.langgraph_step) fuehrt ein Subagent
+ *  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
+@@ -99856,9 +99871,23 @@
+ 		}
+ 		if (!JSON.stringify(tc.args ?? {}).includes("{{data:")) continue;
+ 		try {
+-			const { args, unknown } = await bosToolData.expandArgs(tc.args, { user, conversationIds });
++			/** BOS-Patch code-data-file: in der Codeausfuehrung wird der Verweis zum Pfad einer JSON-Datei. */
++			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
++			if (isCode && !user) throw new Error("no user for the code upload");
++			const { args, unknown, codeFiles } = await bosToolData.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeDataUploader(configurable, user) : null);
+ 			if (unknown.length > 0) blocked.set(tc, errorResult(tc, `Unknown data reference ${unknown.join("; ")}; nothing was run. Use only references from [DATA] lines of this chat, or have the data fetched again.`));
+-			else tc.args = args;
++			else {
++				tc.args = args;
++				if (codeFiles.length > 0) {
++					const names = new Set(codeFiles.map((file) => file.name));
++					const prior = tc.codeSessionContext == null ? void 0 : {
++						...tc.codeSessionContext,
++						files: (tc.codeSessionContext.files ?? []).filter((file) => !names.has(file.name))
++					};
++					const merged = mergeCodeFilesIntoContext(prior, codeFiles);
++					if (merged) tc.codeSessionContext = merged;
++				}
++			}
+ 		} catch (error) {
+ 			_librechat_data_schemas.logger.error("[bosToolData] tool arguments", error);
+ 			blocked.set(tc, errorResult(tc, "Data references could not be resolved; nothing was run. Try again later."));
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs
+@@ -464,15 +464,36 @@
+ 	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, mapStrings(item, replace)]));
+ 	return value;
+ }
++/** BOS-Patch code-data-file: In der Codeausfuehrung wird ein Verweis zur JSON-Datei unter /mnt/data,
++ *  {{data:D-...:spalte}} als Liste der Werte, sonst als Liste von Objekten. Eingesetzter Text muesste in
++ *  Python- oder Shell-Strings richtig maskiert sein; ein \" in einem Wert wurde dort zu " und das JSON
++ *  ungueltig. */
++function fileForCode(set, wanted) {
++	const columns = wanted.length > 0 ? wanted : set.columns;
++	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => row[columns[0]] ?? null) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? null])));
++	return {
++		name: `${[set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80)}.json`,
++		content: JSON.stringify(rows, null, 1)
++	};
++}
+ /** Setzt Verweise in die Argumente eines Werkzeugaufrufs ein, bevor das Werkzeug laeuft.
+- *  So laufen Listen aus Griffen nie durch ein Modell. */
+-async function expandArgs(args, scope) {
++ *  So laufen Listen aus Griffen nie durch ein Modell. Mit upload (Codeausfuehrung) wird jeder Verweis
++ *  als Datei hochgeladen und zu ihrem Pfad. */
++async function expandArgs(args, scope, upload) {
+ 	const texts = stringsOf(args).filter((text) => text.includes("{{data:"));
+-	if (texts.length === 0) return { args, unknown: [] };
++	if (texts.length === 0) return { args, unknown: [], codeFiles: [] };
+ 	const { found, unknown } = await lookupRefs(texts, scope);
+-	if (unknown.length > 0) return { args, unknown };
+-	const replace = (text) => text.replace(REF_PATTERN, (ref) => formatForTool(found.get(ref).set, found.get(ref).wanted));
+-	return { args: mapStrings(args, replace), unknown };
++	if (unknown.length > 0) return { args, unknown, codeFiles: [] };
++	const codeFiles = [];
++	const paths = new Map();
++	if (upload) for (const [ref, { set, wanted }] of found) {
++		const file = fileForCode(set, wanted);
++		const codeFile = await upload(file);
++		codeFiles.push(codeFile);
++		paths.set(ref, `/mnt/data/${codeFile.name}`);
++	}
++	const replace = (text) => text.replace(REF_PATTERN, (ref) => paths.get(ref) ?? formatForTool(found.get(ref).set, found.get(ref).wanted));
++	return { args: mapStrings(args, replace), unknown, codeFiles };
+ }
+ /** Die juengsten Mengen der Chats, ohne ihre Zeilen zu laden. */
+ async function recentSets({ user, conversationIds }, exclude) {
