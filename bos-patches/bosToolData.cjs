@@ -252,9 +252,18 @@ function extract(message, args) {
 		};
 	});
 }
+/** Spalten, die beim Einsetzen zu Links werden, geprueft an der ersten Zeile. */
+function linkedColumns(set) {
+	const row = set.rows[0] ?? {};
+	return set.columns.filter((name) => {
+		const url = String(row[name] ?? "") === "" ? null : linkOf(set, name, row);
+		return Boolean(url) && /^https?:\/\/[^\s()]+$/.test(url);
+	});
+}
 function handleLine(set) {
 	const sample = set.columns.slice(0, 4).map((name) => `${name}=${String(set.rows[0][name] ?? "").slice(0, 40)}`).join(", ");
-	return `[DATA ${set.id} | ${set.source} | ${set.rows.length} rows${set.note} | columns: ${set.columns.join(", ")} | first row: ${sample}]`;
+	const links = linkedColumns(set);
+	return `[DATA ${set.id} | ${set.source} | ${set.rows.length} rows${set.note} | columns: ${set.columns.join(", ")}${links.length > 0 ? ` | links: ${links.join(", ")}` : ""} | first row: ${sample}]`;
 }
 /** Spalten, die eine Zeile kennzeichnen: fast nur verschiedene Werte, keine Statusspalten. */
 function identifyingValues(set) {
@@ -349,6 +358,12 @@ function linkOf(set, name, row) {
 	const value = String(row[name] ?? "");
 	if (server === "trac" && tool.startsWith("ticket_") && (name === "id" || name === "key")) {
 		return /^#?\d+$/.test(value) ? `http://tl.bos.local/trac/ticket/${value.replace("#", "")}` : null;
+	}
+	if (server === "trac" && tool.startsWith("milestone_") && (name === "id" || name === "name")) {
+		// In Textzeilen ist id nur das erste Wort; ein Name mit Leerzeichen ("DPM 1.0") bleibt ohne Link.
+		const line = row.line === void 0 ? null : String(row.line);
+		const whole = line === null || line === value || line.startsWith(`${value} |`);
+		return value === "" || !whole ? null : `http://tl.bos.local/trac/milestone/${encodeURIComponent(value)}`;
 	}
 	if (server === "jira-mercedes" && name === "key") {
 		return /^[A-Z][A-Z0-9_]*-\d+$/.test(value) ? `https://mercedes-benz.atlassian.net/browse/${value}` : null;
