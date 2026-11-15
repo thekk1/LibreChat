@@ -468,9 +468,21 @@ function mapStrings(value, replace) {
  *  {{data:D-...:spalte}} als Liste der Werte, sonst als Liste von Objekten. Eingesetzter Text muesste in
  *  Python- oder Shell-Strings richtig maskiert sein; ein \" in einem Wert wurde dort zu " und das JSON
  *  ungueltig. */
+/** Eine Zelle, die eine Liste oder ein Objekt als JSON-Text haelt (cell() macht daraus Text, etwa die Sprints
+ *  [{"name":...,"state":...}]), kommt in der Datei als Struktur zurueck. Nur Text, der mit [{ oder {" beginnt
+ *  und sich vollstaendig lesen laesst; ein gekuerzter Wert bleibt Text. */
+function structuredCell(value) {
+	if (typeof value !== "string" || !(value.startsWith("[{") || value.startsWith("{\""))) return value;
+	try {
+		const parsed = JSON.parse(value);
+		return parsed !== null && typeof parsed === "object" ? parsed : value;
+	} catch {
+		return value;
+	}
+}
 function fileForCode(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
-	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => row[columns[0]] ?? null) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? null])));
+	const rows = columns.length === 1 && wanted.length === 1 ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, structuredCell(row[name] ?? null)])));
 	return {
 		name: `${[set.id, ...wanted].join("-").replace(/[^A-Za-z0-9-]/g, "_").slice(0, 80)}.json`,
 		content: JSON.stringify(rows, null, 1)
