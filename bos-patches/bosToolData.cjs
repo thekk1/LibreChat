@@ -175,7 +175,8 @@ function lineFields(body) {
 	if (url !== null) row.url = url;
 	return row;
 }
-/** Zeilen einer Folge als Spalten, wenn alle Zeilen dieselben Felder in derselben Reihenfolge haben. */
+/** Zeilen einer Folge als Spalten, wenn alle Zeilen dieselben Felder in derselben Reihenfolge haben.
+ *  Die URL bleibt in den Zeilen als Linkziel der ersten Spalte, aber nicht als eigene Spalte. */
 function fieldRows(bodies) {
 	const rows = bodies.map(lineFields);
 	if (rows.some((row) => row === null)) return null;
@@ -195,9 +196,10 @@ function textLists(text) {
 		if (split && split.length >= MIN_ROWS) found.push({ field: "table", rows: split });
 		else if (run.length >= MIN_ROWS) {
 			const bodies = run.map((line) => line.replace(/^\s*([-*•]|\d+[.)]|\|)\s+/, "").trim());
-			found.push({
+			const fields = fieldRows(bodies);
+			found.push(fields ? { field: "lines", rows: fields, hidden: ["url"] } : {
 				field: "lines",
-				rows: fieldRows(bodies) ?? bodies.map((body) => ({ id: body.split(/\s+/)[0].replace(/^[#"'`]+|[:,;"'`]+$/g, ""), line: body }))
+				rows: bodies.map((body) => ({ id: body.split(/\s+/)[0].replace(/^[#"'`]+|[:,;"'`]+$/g, ""), line: body }))
 			});
 		}
 		run = [];
@@ -238,7 +240,7 @@ function extract(message, args) {
 	if (data !== void 0) jsonLists(data, "", 0, lists);
 	else lists.push(...textLists(text));
 	return lists.map((list) => {
-		const columns = columnsOf(list.rows);
+		const columns = columnsOf(list.rows).filter((name) => !list.hidden?.includes(name));
 		const source = `${message.name ?? "tool"} ${list.field}${shortArgs(args) ? ` ${shortArgs(args)}` : ""}`;
 		const hash = crypto.createHash("sha256").update(message.name ?? "").update(JSON.stringify(list.rows)).digest("hex");
 		return {
@@ -357,6 +359,8 @@ function linkOf(set, name, row) {
 		// Jenkins nennt seine Stammadresse http://jenkins:8090/, die nur mit passendem Suchsuffix aufloest.
 		return row.url ? String(row.url).replace(/^http:\/\/jenkins:8090\//, "http://jenkins.bos.local:8090/") : null;
 	}
+	// Zeilen mit Feldern: die URL der Zeile ist keine Spalte, sie verlinkt die erste Spalte.
+	if (name === set.columns?.[0] && !set.columns.includes("url") && row.url) return String(row.url);
 	return null;
 }
 function linked(set, name, row, text) {
