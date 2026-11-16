@@ -9,6 +9,8 @@ const MIN_ROWS = 20;
 const TTL_DAYS = 30;
 const MAX_COLUMNS = 30;
 const MAX_CELL = 2000;
+const MAX_SHOWN_CELL = 200;
+const PAGE_ARGS = ["page", "offset", "start", "start_at", "startAt", "skip", "cursor", "next_page_token", "nextPageToken", "page_token", "pageToken"];
 const MAX_HANDLES = 10;
 const MAX_STORED_BYTES = 12 * 1024 * 1024;
 const TYPED_SHARE = .9;
@@ -61,10 +63,16 @@ const isScalar = (value) => value === null || typeof value !== "object";
 function cell(value) {
 	if (value === null || value === void 0) return null;
 	if (typeof value === "number" || typeof value === "boolean") return value;
-	if (Array.isArray(value) && value.every(isScalar)) value = value.join(", ");
+	// Eine Liste einfacher Werte bleibt eine Liste: Code bekommt sie so, Antwort und Werkzeuge als "a, b".
+	if (Array.isArray(value) && value.every(isScalar)) {
+		if (JSON.stringify(value).length <= MAX_CELL) return value.map((item) => item ?? null);
+		value = value.join(", ");
+	}
 	const text = typeof value === "object" ? JSON.stringify(value) : String(value);
 	return text.length > MAX_CELL ? `${text.slice(0, MAX_CELL)}...` : text;
 }
+/** Zelle als Text: eine Liste einfacher Werte durch Komma getrennt. */
+const cellText = (value) => Array.isArray(value) ? value.map((item) => String(item ?? "")).join(", ") : String(value ?? "");
 const isEmpty = (value) => value === "" || value === null || value === void 0;
 function flattenRow(item) {
 	if (isScalar(item)) return { value: cell(item) };
@@ -248,7 +256,63 @@ function extract(message, args) {
 			source,
 			columns,
 			rows: list.rows,
-			note: totalNote(data, list.rows.length)
+			note: totalNote(data, list.rows.length),
+			pages: pageKey(message.name, list.field, args),
+			total: totalOf(data)
+		};
+	});
+}
+/** Seiten derselben Abfrage (gleiches Werkzeug und gleiche Argumente bis auf page, offset, ...). */
+function pageKey(tool, field, args) {
+	if (args === null || typeof args !== "object" || !PAGE_ARGS.some((name) => name in args)) return null;
+	const rest = Object.entries(args).filter(([name]) => !PAGE_ARGS.includes(name)).sort(([a], [b]) => a.localeCompare(b));
+	return JSON.stringify([tool ?? "tool", field, rest]);
+}
+function totalOf(data) {
+	if (data === null || typeof data !== "object" || Array.isArray(data)) return null;
+	for (const name of TOTAL_FIELDS) if (typeof data[name] === "number") return data[name];
+	return null;
+}
+/** Fuehrt die Seiten einer Abfrage zu einer Menge zusammen: Der Hauptagent setzt sie mit einem Verweis ein,
+ *  und ab 100 Zeilen wird sie ein Artefakt. Gleiche Zeilen (eine Seite zweimal geholt) zaehlen einmal. */
+function mergePages(sets) {
+	const groups = /* @__PURE__ */ new Map();
+	const out = [];
+	for (const set of sets) {
+		if (set.pages === null || set.pages === void 0) {
+			out.push(set);
+			continue;
+		}
+		if (!groups.has(set.pages)) {
+			groups.set(set.pages, []);
+			out.push(set.pages);
+		}
+		groups.get(set.pages).push(set);
+	}
+	return out.map((entry) => {
+		if (typeof entry !== "string") return entry;
+		const pages = groups.get(entry);
+		if (pages.length === 1) return pages[0];
+		const seen = /* @__PURE__ */ new Set();
+		const rows = [];
+		for (const page of pages) for (const row of page.rows) {
+			const key = JSON.stringify(row);
+			if (!seen.has(key)) {
+				seen.add(key);
+				rows.push(row);
+			}
+		}
+		const last = pages[pages.length - 1];
+		const total = pages.map((page) => page.total).find((value) => typeof value === "number") ?? null;
+		const hash = crypto.createHash("sha256").update(entry).update(JSON.stringify(rows)).digest("hex");
+		return {
+			id: `D-${hash.slice(0, 6)}`,
+			source: `${pages[0].source.replace(/ (page|offset|start|start_at|startAt|skip|cursor|next_page_token|nextPageToken|page_token|pageToken)=\S*/g, "")} pages=${pages.length}`,
+			columns: [...new Set(pages.flatMap((page) => page.columns))].slice(0, MAX_COLUMNS),
+			rows,
+			note: total !== null ? total > rows.length ? `, of ${total}` : "" : last.note,
+			pages: null,
+			total
 		};
 	});
 }
@@ -256,12 +320,12 @@ function extract(message, args) {
 function linkedColumns(set) {
 	const row = set.rows[0] ?? {};
 	return set.columns.filter((name) => {
-		const url = String(row[name] ?? "") === "" ? null : linkOf(set, name, row);
+		const url = cellText(row[name]) === "" ? null : linkOf(set, name, row);
 		return Boolean(url) && /^https?:\/\/[^\s()]+$/.test(url);
 	});
 }
 function handleLine(set) {
-	const sample = set.columns.slice(0, 4).map((name) => `${name}=${String(set.rows[0][name] ?? "").slice(0, 40)}`).join(", ");
+	const sample = set.columns.slice(0, 4).map((name) => `${name}=${cellText(set.rows[0][name]).slice(0, 40)}`).join(", ");
 	const links = linkedColumns(set);
 	return `[DATA ${set.id} | ${set.source} | ${set.rows.length} rows${set.note} | columns: ${set.columns.join(", ")}${links.length > 0 ? ` | links: ${links.join(", ")}` : ""} | first row: ${sample}]`;
 }
@@ -269,14 +333,14 @@ function handleLine(set) {
 function identifyingValues(set) {
 	const values = /* @__PURE__ */ new Set();
 	for (const name of set.columns) {
-		const column = set.rows.map((row) => typeof row[name] === "number" ? String(row[name]) : row[name]).filter((value) => typeof value === "string" && value.length >= 3);
+		const column = set.rows.map((row) => typeof row[name] === "number" || Array.isArray(row[name]) ? cellText(row[name]) : row[name]).filter((value) => typeof value === "string" && value.length >= 3);
 		if (column.length < set.rows.length * .9 || new Set(column).size < column.length * .9) continue;
 		for (const value of column) if (!/\s/.test(value)) values.add(value);
 	}
 	return values;
 }
 const TOKEN = /[^\s,;|`"'()[\]*:]+/g;
-const plainCell = (value) => String(value ?? "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[`*]/g, "").replace(/\s+/g, " ").trim();
+const plainCell = (value) => cellText(value).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[`*]/g, "").replace(/\s+/g, " ").trim();
 /** Mengen ohne kennzeichnende Spalte (Dateinamen mit Leerzeichen, mehrfach vorkommende Werte): Eine
  *  Tabellenzeile gehoert zur Menge, wenn alle ihre Zellen Werte derselben Zeile der Menge sind. */
 function rowMatcher(set) {
@@ -361,7 +425,7 @@ function nameColumns(content, set) {
 function typedColumns(content, set) {
 	let count = 0;
 	for (const name of set.columns) {
-		const values = set.rows.slice(0, 200).map((row) => String(row[name] ?? "").trim()).filter((value) => value.length >= 3 && value.length <= 200);
+		const values = set.rows.slice(0, 200).map((row) => cellText(row[name]).trim()).filter((value) => value.length >= 3 && value.length <= 200);
 		if (values.length > 0 && values.filter((value) => content.includes(value)).length >= values.length / 2) count++;
 	}
 	return count;
@@ -385,7 +449,7 @@ async function collect({ content, messages, user, conversationId }) {
 	await indexReady;
 	const now = Date.now();
 	const stored = [];
-	for (const found of [...sets.values()].slice(-MAX_HANDLES)) {
+	for (const found of mergePages([...sets.values()]).slice(-MAX_HANDLES)) {
 		const set = nameColumns(content, found);
 		if (Buffer.byteLength(JSON.stringify(set.rows)) > MAX_STORED_BYTES) continue;
 		await col.updateOne({ id: set.id, user: String(user), conversationId }, {
@@ -406,7 +470,7 @@ async function collect({ content, messages, user, conversationId }) {
 /** Ziel eines Werts im Antworttext: Ticket, Issue, Job oder Datei im System, aus dem die Zeile stammt. */
 function linkOf(set, name, row) {
 	const [, tool, server] = String(set.source ?? "").match(/^(\S*)_mcp_(\S+)/) ?? [];
-	const value = String(row[name] ?? "");
+	const value = cellText(row[name]);
 	if (server === "trac" && tool.startsWith("ticket_") && (name === "id" || name === "key")) {
 		return /^#?\d+$/.test(value) ? `http://tl.bos.local/trac/ticket/${value.replace("#", "")}` : null;
 	}
@@ -436,8 +500,10 @@ function linked(set, name, row, text) {
 }
 function formatRows(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
-	if (columns.length === 1) return set.rows.map((row) => linked(set, columns[0], row, String(row[columns[0]] ?? ""))).join(", ");
-	const escape = (value) => String(value ?? "").replace(/\|/g, "\\|").replace(/\s*\n\s*/g, " ");
+	if (columns.length === 1) return set.rows.map((row) => linked(set, columns[0], row, cellText(row[columns[0]]))).join(", ");
+	// Langtext (Auszuege, Beschreibungen) macht die Tabelle im Chat unlesbar breit; Code bekommt ihn ganz.
+	const shown = (text) => text.length > MAX_SHOWN_CELL ? `${text.slice(0, MAX_SHOWN_CELL).trimEnd()} …` : text;
+	const escape = (value) => shown(cellText(value).replace(/\s*\n\s*/g, " ")).replace(/\|/g, "\\|");
 	return [`| ${columns.join(" | ")} |`, `|${columns.map(() => "---").join("|")}|`, ...set.rows.map((row) => `| ${columns.map((name) => linked(set, name, row, escape(row[name]))).join(" | ")} |`)].join("\n");
 }
 /** Setzt Verweise ein. Nur Daten desselben Nutzers und Chats sind erreichbar. */
@@ -498,11 +564,17 @@ async function lookupRefs(texts, { user, conversationIds }) {
 function formatForTool(set, wanted) {
 	const columns = wanted.length > 0 ? wanted : set.columns;
 	if (columns.length === 1) {
-		const values = set.rows.map((row) => String(row[columns[0]] ?? ""));
+		const values = set.rows.map((row) => cellText(row[columns[0]]));
 		return values.some((value) => /[,;\r\n]/.test(value)) ? JSON.stringify(values) : values.join(", ");
 	}
-	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, row[name] ?? null]))));
+	return JSON.stringify(set.rows.map((row) => Object.fromEntries(columns.map((name) => [name, Array.isArray(row[name]) ? cellText(row[name]) : row[name] ?? null]))));
 }
+/** LibreChat speichert die Argumente nach dem Einsetzen: Im Verlauf steht /mnt/data/D-....json statt des
+ *  Verweises, und das Modell schreibt den Pfad ab. In einer spaeteren Antwort gibt es die Datei nicht. Der
+ *  Pfad der ganzen Menge wird deshalb wieder zum Verweis. Dateien einzelner Spalten bleiben: Ihr Name zeigt
+ *  die Spaltenwahl nicht sicher, und im selben Lauf gibt es sie noch. */
+const DATA_PATH = /\/mnt\/data\/(D-[0-9a-f]{6})\.json/g;
+const dataPathRefs = (args) => mapStrings(args, (text) => text.replace(DATA_PATH, (path, id) => `{{data:${id}}}`));
 function stringsOf(value, out = []) {
 	if (typeof value === "string") out.push(value);
 	else if (Array.isArray(value)) for (const item of value) stringsOf(item, out);
@@ -538,7 +610,7 @@ function fileForCode(set, wanted) {
 	const single = columns.length === 1 && wanted.length === 1;
 	const links = single ? [] : linkedColumns(set).filter((name) => columns.includes(name) && !set.columns.includes(`${name}_url`));
 	const target = (name, row) => {
-		const url = String(row[name] ?? "") === "" ? null : linkOf(set, name, row);
+		const url = cellText(row[name]) === "" ? null : linkOf(set, name, row);
 		return url && /^https?:\/\/[^\s()]+$/.test(url) ? url : null;
 	};
 	const rows = single ? set.rows.map((row) => structuredCell(row[columns[0]] ?? null)) : set.rows.map((row) => ({
@@ -675,4 +747,4 @@ function createAnswerFilter({ renderFiles } = {}) {
 		}
 	};
 }
-module.exports = { formatRows, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, nameColumns, rankForStrip, handleLine, messageText };
+module.exports = { formatRows, cellText, mergePages, dataPathRefs, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, nameColumns, rankForStrip, handleLine, messageText };
