@@ -354,7 +354,12 @@ function rowMatcher(set) {
 		const cells = (splitCells(line) ?? []).map(plainCell).filter((value) => value !== "");
 		if (cells.length < 2) return -1;
 		const longest = cells.reduce((a, b) => b.length > a.length ? b : a);
-		return (byValue.get(longest) ?? []).find((index) => cells.every((value) => rows[index].has(value))) ?? -1;
+		const full = (byValue.get(longest) ?? []).find((index) => cells.every((value) => rows[index].has(value)));
+		if (full !== void 0) return full;
+		// Gekuerzte Zellen (Auszuege, Beschreibungen): Ein Wert, der nur in einer Zeile der Menge steht (ein
+		// Pfad, ein Schluessel), bestimmt die Zeile.
+		const unique = cells.map((value) => value.length >= 3 ? byValue.get(value) : void 0).find((indexes) => indexes?.length === 1);
+		return unique ? unique[0] : -1;
 	};
 }
 /** Entfernt nur vollstaendig abgetippte Mengen; eine gefilterte Teilmenge ist ein Ergebnis und bleibt. */
@@ -373,6 +378,7 @@ function stripTyped(content, set) {
 	const hits = lines.map((line) => matchRow ? rowHit(line) : [...line.matchAll(TOKEN)].map(word).filter((hit) => values.has(hit.text)));
 	const separator = (line) => line.trim() === "" || /^\s*\|?[\s:|-]+\|?\s*$/.test(line);
 	const structured = (line) => /^\s*([-*•|]|\d+[.)])/.test(line);
+	const blocks = [];
 	for (let start = 0; start < lines.length; start++) {
 		if (hits[start].length === 0) continue;
 		let end = start;
@@ -389,16 +395,27 @@ function stripTyped(content, set) {
 		}
 		const distinct = new Set();
 		for (let index = start; index <= end; index++) for (const hit of hits[index]) distinct.add(hit.text);
-		if (distinct.size >= needed) {
-			const first = hits[start][0];
-			const lastHits = hits[end];
-			const last = lastHits[lastHits.length - 1];
-			const before = matchRow || structured(lines[start]) ? "" : lines[start].slice(0, first.index);
-			const after = matchRow || structured(lines[end]) ? "" : lines[end].slice(last.index + last.text.length);
-			const note = `${before}[${distinct.size} rows, see ${set.id}]${after}`;
-			lines.splice(start, end - start + 1, note);
-			hits.splice(start, end - start + 1, []);
-		}
+		blocks.push({ start, end, distinct });
+		start = end;
+	}
+	const strip = blocks.filter((block) => block.distinct.size >= needed);
+	// Seitenweise abgetippt: Tabellen oder Listen, die sich nicht ueberschneiden und zusammen die Menge
+	// abdecken. Eine Teilmenge wiederholt Zeilen einer anderen Tabelle und bleibt deshalb stehen.
+	const parts = blocks.filter((block) => !strip.includes(block) && block.distinct.size >= 2 && structured(lines[block.start]));
+	const union = new Set(parts.flatMap((block) => [...block.distinct]));
+	if (parts.length > 1 && union.size >= needed && union.size === parts.reduce((sum, block) => sum + block.distinct.size, 0)) strip.push(...parts);
+	for (const block of strip.sort((a, b) => b.start - a.start)) {
+		const { end, distinct } = block;
+		let { start } = block;
+		// Kopfzeile und Trennlinie einer ersetzten Tabelle gehen mit; sonst bleibt ein Tabellenrest stehen.
+		const head = start >= 2 && SEPARATOR_ROW.test(lines[start - 1]) && PIPE_ROW.test(lines[start - 2]) && hits[start - 2].length === 0 ? 2 : 0;
+		const first = hits[start][0];
+		const lastHits = hits[end];
+		const last = lastHits[lastHits.length - 1];
+		const before = matchRow || structured(lines[start]) ? "" : lines[start].slice(0, first.index);
+		const after = matchRow || structured(lines[end]) ? "" : lines[end].slice(last.index + last.text.length);
+		const note = `${before}[${distinct.size} ${distinct.size === set.rows.length || parts.length < 2 || !parts.includes(block) ? "rows" : `of ${set.rows.length} rows`}, see ${set.id}]${after}`;
+		lines.splice(start - head, end - start + 1 + head, note);
 	}
 	return lines.join("\n");
 }
