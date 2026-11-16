@@ -276,15 +276,37 @@ function identifyingValues(set) {
 	return values;
 }
 const TOKEN = /[^\s,;|`"'()[\]*:]+/g;
+const plainCell = (value) => String(value ?? "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[`*]/g, "").replace(/\s+/g, " ").trim();
+/** Mengen ohne kennzeichnende Spalte (Dateinamen mit Leerzeichen, mehrfach vorkommende Werte): Eine
+ *  Tabellenzeile gehoert zur Menge, wenn alle ihre Zellen Werte derselben Zeile der Menge sind. */
+function rowMatcher(set) {
+	if (set.columns.length < 2 || set.rows.length < MIN_ROWS) return null;
+	const rows = set.rows.map((row) => new Set(set.columns.map((name) => plainCell(row[name])).filter((value) => value !== "")));
+	const byValue = /* @__PURE__ */ new Map();
+	rows.forEach((values, index) => {
+		for (const value of values) byValue.set(value, [...byValue.get(value) ?? [], index]);
+	});
+	return (line) => {
+		const cells = (splitCells(line) ?? []).map(plainCell).filter((value) => value !== "");
+		if (cells.length < 2) return -1;
+		const longest = cells.reduce((a, b) => b.length > a.length ? b : a);
+		return (byValue.get(longest) ?? []).find((index) => cells.every((value) => rows[index].has(value))) ?? -1;
+	};
+}
 /** Entfernt nur vollstaendig abgetippte Mengen; eine gefilterte Teilmenge ist ein Ergebnis und bleibt. */
 function stripTyped(content, set) {
 	const values = identifyingValues(set);
-	if (values.size < MIN_ROWS) return content;
+	const matchRow = values.size < MIN_ROWS ? rowMatcher(set) : null;
+	if (values.size < MIN_ROWS && matchRow === null) return content;
 	const needed = Math.ceil(set.rows.length * TYPED_SHARE);
 	const lines = content.split("\n");
 	// Ein Satzzeichen am Wortende gehoert nicht zum Wert ("..., ABC-12.").
 	const word = (match) => ({ index: match.index, text: match[0].replace(/[.!?]+$/, "") });
-	const hits = lines.map((line) => [...line.matchAll(TOKEN)].map(word).filter((hit) => values.has(hit.text)));
+	const rowHit = (line) => {
+		const index = matchRow(line);
+		return index < 0 ? [] : [{ index: 0, text: `row ${index}` }];
+	};
+	const hits = lines.map((line) => matchRow ? rowHit(line) : [...line.matchAll(TOKEN)].map(word).filter((hit) => values.has(hit.text)));
 	const separator = (line) => line.trim() === "" || /^\s*\|?[\s:|-]+\|?\s*$/.test(line);
 	const structured = (line) => /^\s*([-*•|]|\d+[.)])/.test(line);
 	for (let start = 0; start < lines.length; start++) {
@@ -307,14 +329,33 @@ function stripTyped(content, set) {
 			const first = hits[start][0];
 			const lastHits = hits[end];
 			const last = lastHits[lastHits.length - 1];
-			const before = structured(lines[start]) ? "" : lines[start].slice(0, first.index);
-			const after = structured(lines[end]) ? "" : lines[end].slice(last.index + last.text.length);
+			const before = matchRow || structured(lines[start]) ? "" : lines[start].slice(0, first.index);
+			const after = matchRow || structured(lines[end]) ? "" : lines[end].slice(last.index + last.text.length);
 			const note = `${before}[${distinct.size} rows, see ${set.id}]${after}`;
 			lines.splice(start, end - start + 1, note);
 			hits.splice(start, end - start + 1, []);
 		}
 	}
 	return lines.join("\n");
+}
+/** Eine Tabelle, die Code ohne Kopfzeile ausgibt, hat die Spalten c1, c2, ... Tippt der Subagent
+ *  dieselben Zeilen mit Kopfzeile in seine Antwort, bekommt die Menge diese Namen: Der Hauptagent
+ *  setzt sie sonst mit der Kopfzeile "c1 | c2 | c3" in seine Antwort ein. */
+function nameColumns(content, set) {
+	if (!set.columns.every((name, index) => name === `c${index + 1}`)) return set;
+	const matchRow = rowMatcher(set);
+	if (matchRow === null) return set;
+	const lines = content.split("\n");
+	const start = lines.findIndex((line, index) => index >= 2 && matchRow(line) >= 0 && SEPARATOR_ROW.test(lines[index - 1]) && PIPE_ROW.test(lines[index - 2]));
+	if (start < 0) return set;
+	const header = splitCells(lines[start - 2]).map(plainCell);
+	if (header.length !== set.columns.length) return set;
+	const names = columnNames(header, header.length);
+	return {
+		...set,
+		columns: names,
+		rows: set.rows.map((row) => Object.fromEntries(names.map((name, index) => [name, row[set.columns[index]] ?? null])))
+	};
 }
 /** Zahl der Spalten, deren Werte zur Haelfte im Text stehen: Welche Menge hat der Subagent abgetippt? */
 function typedColumns(content, set) {
@@ -344,7 +385,8 @@ async function collect({ content, messages, user, conversationId }) {
 	await indexReady;
 	const now = Date.now();
 	const stored = [];
-	for (const set of [...sets.values()].slice(-MAX_HANDLES)) {
+	for (const found of [...sets.values()].slice(-MAX_HANDLES)) {
+		const set = nameColumns(content, found);
 		if (Buffer.byteLength(JSON.stringify(set.rows)) > MAX_STORED_BYTES) continue;
 		await col.updateOne({ id: set.id, user: String(user), conversationId }, {
 			$setOnInsert: {
@@ -633,4 +675,4 @@ function createAnswerFilter({ renderFiles } = {}) {
 		}
 	};
 }
-module.exports = { formatRows, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, rankForStrip, handleLine, messageText };
+module.exports = { formatRows, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, nameColumns, rankForStrip, handleLine, messageText };
