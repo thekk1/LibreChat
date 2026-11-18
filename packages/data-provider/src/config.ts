@@ -3492,6 +3492,7 @@ export const interfaceSchema = z
     temporaryChat: z.boolean().optional(),
     temporaryChatRetention: z.number().min(1).max(8760).optional(),
     generalChatRetention: z.number().min(1).max(8760).optional(),
+    renewRetentionOnActivity: z.boolean().optional(),
     autoSubmitFromUrl: z.boolean().optional(),
     /** Accept `?theme=dark|light|system` on an entry link as the user's colour mode, so another app can hand its mode over. */
     colorModeFromUrl: z.boolean().optional(),

@@ -107,6 +107,7 @@ const AGENT_EVENT_ACTOR_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60_000;
 const MAX_AGENT_EVENT_ACTOR_SUSPENSION_BYTES = 64 * 1_024;
 /** MeiliSearch's default `pagination.maxTotalHits` ceiling. */
 const MEILI_SEARCH_LIMIT = 1000;
+const RETENTION_RENEWAL_INTERVAL_MS = 60 * 60_000;
 /** Ceiling for a single conversation page; the sidebar's largest request is 100. */
 const MAX_CONVO_PAGE_SIZE = 100;
 const DEFAULT_CONVO_PAGE_SIZE = 25;
@@ -340,6 +341,16 @@ export interface ConversationMethods {
     ctx: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
     target: { conversationId: string; messageIds?: string[] },
   ): Promise<void>;
+  /**
+   * Moves a chat's retention deadline to one retention period from now, with the messages, tool
+   * calls, shared links and subagent threads that carry the same deadline. Returns the new
+   * deadline, or `null` when the switch is off or the chat is temporary, expired, or renewed
+   * within the last hour.
+   */
+  renewConversationRetention(
+    ctx: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
+    conversationId: string,
+  ): Promise<Date | null>;
   setConvoPinned(
     user: string,
     conversationId: string,
@@ -2324,6 +2335,72 @@ export function createConversationMethods(
       logger.error('[getConvoRetention] Error getting conversation retention fields', error);
       throw new Error('Error getting conversation retention fields');
     }
+  }
+
+  async function renewConversationRetention(
+    { userId, interfaceConfig }: { userId: string; interfaceConfig?: AppConfig['interfaceConfig'] },
+    conversationId: string,
+  ): Promise<Date | null> {
+    if (
+      !userId ||
+      !interfaceConfig?.renewRetentionOnActivity ||
+      interfaceConfig.retentionMode !== RetentionMode.ALL ||
+      interfaceConfig.generalChatRetention === undefined
+    ) {
+      return null;
+    }
+    const Conversation = mongoose.models.Conversation as Model<IConversation>;
+    const expiredAt = createChatExpirationDate(interfaceConfig, false);
+    const renewable = {
+      user: userId,
+      conversationId,
+      isTemporary: { $ne: true },
+      agentEventBinding: { $exists: false },
+      $or: [
+        { expiredAt: null },
+        {
+          expiredAt: {
+            $gt: new Date(),
+            /** Every message of the chat is rewritten, so one write an hour is enough. */
+            $lt: new Date(expiredAt.getTime() - RETENTION_RENEWAL_INTERVAL_MS),
+          },
+        },
+      ],
+    };
+    const stored = await Conversation.findOne(renewable, '_id').lean();
+    if (stored == null) {
+      return null;
+    }
+    const threads = await Conversation.find(
+      { user: userId, 'subagentThread.rootConversationId': conversationId },
+      'conversationId',
+    ).lean();
+    const conversationIds = [conversationId, ...threads.map((thread) => thread.conversationId)];
+    const inChat = { user: userId, conversationId: { $in: conversationIds } };
+    const update = { $set: { expiredAt, isTemporary: false } };
+    /** The chat itself goes last: a failed write leaves it due, so the next turn retries. */
+    await Promise.all([
+      mongoose.models.Message.updateMany({ ...inChat, isTemporary: { $ne: true } }, update, {
+        timestamps: false,
+      }),
+      mongoose.models.ToolCall.updateMany(
+        { ...inChat, expiredAt: { $ne: null } },
+        { $set: { expiredAt } },
+        { timestamps: false },
+      ),
+      mongoose.models.SharedLink.updateMany(
+        { ...inChat, expiredAt: { $ne: null } },
+        { $set: { expiredAt } },
+        { timestamps: false },
+      ),
+      Conversation.updateMany(
+        { user: userId, 'subagentThread.rootConversationId': conversationId },
+        update,
+        { timestamps: false },
+      ),
+    ]);
+    await Conversation.updateOne({ _id: stored._id }, update, { timestamps: false });
+    return expiredAt;
   }
 
   /**
@@ -4701,6 +4778,7 @@ export function createConversationMethods(
     listActiveSubagentThreadLeases,
     getConvoOwnership,
     getConvoRetention,
+    renewConversationRetention,
     getConvoTitle,
     markConvoSeen,
     markConvoUnread,

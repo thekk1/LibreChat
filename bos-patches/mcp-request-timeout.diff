@@ -1,0 +1,44 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -57562,6 +57562,15 @@
+ *   HTTP/2 manages connection persistence differently.
+ */
+ const SSE_REQUEST_HEADERS = { "Cache-Control": "no-cache" };
++/** BOS-Patch mcp-request-timeout: Der Dispatcher fuer POST hat headersTimeout = Timeout der Verbindung.
++*  Antwortet ein Werkzeug nicht rechtzeitig, scheitert neben der Anfrage (-32001) auch der fetch des
++*  POST; das SDK meldet ihn ueber transport.onerror, und der Neuaufbau der Verbindung schloss alle
++*  parallelen Anfragen desselben Nutzers an diesem Server mit "Connection closed". Diese Fehler
++*  betreffen nur die eine Anfrage und werden in customFetch markiert. */
++function bosIsHeadersTimeout(error) {
++	for (let current = error, depth = 0; current != null && depth < 5; current = current.cause, depth++) if (current.code === "UND_ERR_HEADERS_TIMEOUT" || current.name === "HeadersTimeoutError") return true;
++	return false;
++}
+ /** Fatal initialization evidence cannot become a partial or optional catalog. */
+ function requireToolsSnapshot(snapshot) {
+ 	if (isMCPInitializationError(snapshot.authenticationError)) throw snapshot.authenticationError;
+@@ -57835,7 +57844,13 @@
+ 					}
+ 				}
+ 				if (reauthorize) assertDispatch?.(admissionSignal);
+-				const response = await (0, undici.fetch)(currentUrlString, currentInit);
++				let response;
++				try {
++					response = await (0, undici.fetch)(currentUrlString, currentInit);
++				} catch (fetchError) {
++					if (!isGet && fetchError != null && typeof fetchError === "object" && bosIsHeadersTimeout(fetchError)) fetchError.bosRequestHeadersTimeout = true;
++					throw fetchError;
++				}
+ 				if ((rejectDirectBearerAuthentication || reportRejection && reauthorize) && (response.status === 401 || response.status === 403)) {
+ 					await response.body?.cancel().catch(() => void 0);
+ 					const error = new MCPTransportAuthenticationError(response.status);
+@@ -58529,6 +58544,10 @@
+ 			* "Maximum reconnection attempts … exceeded" means the SDK gave up — that one
+ 			* must fall through so our higher-level reconnection takes over.
+ 			*/
++			if (error?.bosRequestHeadersTimeout === true) {
++				_librechat_data_schemas.logger.warn(`${this.getLogPrefix()} A request got no response within ${this.timeout || DEFAULT_TIMEOUT}ms. Only this request fails; the connection stays open for the other requests.`);
++				return;
++			}
+ 			if (rawMessage.startsWith(SDK_SSE_STREAM_DISCONNECTED) || rawMessage.startsWith(SDK_SSE_RECONNECT_FAILED)) {
+ 				_librechat_data_schemas.logger.debug(`${this.getLogPrefix()} SDK SSE stream recovery in progress`);
+ 				return;

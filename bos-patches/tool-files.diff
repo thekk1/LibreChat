@@ -1,0 +1,155 @@
+--- a/api/server/controllers/agents/callbacks.js
++++ b/api/server/controllers/agents/callbacks.js
+@@ -1,5 +1,9 @@
+ const { nanoid } = require('nanoid');
+ const bosToolData = require('/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs');
++const bosToolFiles = require('/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs');
++/** BOS-Patch: Ablage der Anhaenge je Antwort (res), gesetzt von createToolEndCallback. initialize.js reicht
++ *  getDefaultHandlers eine eigene Huelle um den Callback, deshalb nicht ueber den Callback selbst. */
++const bosArtifactSinks = new WeakMap();
+ const { logger } = require('@librechat/data-schemas');
+ const {
+   Tools,
+@@ -435,6 +439,49 @@
+     replayEvents: toolTimingReplayEvents,
+     emit: emitForJob,
+   });
++  /** BOS-Patch: {{data:ID}} im Antworttext wird vor Anzeige und Speicherung eingesetzt, {{file:ID}} wird
++   *  zum Anhang der Antwort. Anhaenge zeigt der Client nur unter einem Werkzeugaufruf derselben Antwort:
++   *  bevorzugt dem, der die Datei geliefert hat, sonst dem letzten des Laufs. */
++  const bosToolCallsByRun = new Map();
++  const answerFilter = bosToolData.createAnswerFilter({
++    renderFiles: (text, metadata, graph) =>
++      bosToolFiles.renderAnswer(
++        text,
++        {
++          user: graph?.config?.configurable?.user_id,
++          conversationIds: [metadata?.thread_id, graph?.config?.configurable?.thread_id],
++        },
++        async (doc) => {
++          const runId = metadata?.run_id;
++          const calls = bosToolCallsByRun.get(runId) ?? [];
++          const toolCallId = calls.includes(doc.toolCallId) ? doc.toolCallId : calls[calls.length - 1];
++          const record = await bosToolFiles.fileRecord(doc);
++          const bosArtifacts = res ? bosArtifactSinks.get(res) : undefined;
++          if (!record || !runId || !toolCallId || !bosArtifacts) {
++            return;
++          }
++          const attachment = {
++            ...record,
++            messageId: runId,
++            toolCallId,
++            conversationId: metadata?.thread_id ?? record.conversationId,
++          };
++          bosArtifacts.artifactPromises.push(Promise.resolve(attachment));
++          if (isStreamWritable(bosArtifacts.res, bosArtifacts.streamId)) {
++            writeAttachment(bosArtifacts.res, bosArtifacts.streamId, attachment, bosArtifacts.jobCreatedAt);
++          }
++        },
++      ),
++  });
++  const deliverMessageDelta = async (event, data, metadata) => {
++    aggregateContent({ event, data });
++    if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
++      await emitForJob({ event, data });
++    } else if (!metadata?.hide_sequential_outputs) {
++      await emitForJob({ event, data });
++    }
++  };
++
+   const handlers = {
+     [StepEvents.ON_TOOL_CALLS_DISPATCHED]: toolTiming.dispatch,
+     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(
+@@ -452,6 +499,11 @@
+        */
+       handle: async (event, data, metadata) => {
+         for (const toolCall of data?.stepDetails?.tool_calls ?? []) {
++          if (toolCall?.id && metadata?.run_id) {
++            const calls = bosToolCallsByRun.get(metadata.run_id) ?? [];
++            calls.push(toolCall.id);
++            bosToolCallsByRun.set(metadata.run_id, calls);
++          }
+           const toolName = toolCall?.name ?? toolCall?.function?.name;
+           if (toolCall?.name == null && typeof toolName === 'string') {
+             toolCall.name = toolName;
+@@ -898,7 +950,7 @@
+   /**
+    * @type {ToolEndCallback}
+    */
+-  return async (data, metadata) => {
++  const toolEndCallback = async (data, metadata) => {
+     const output = data?.output;
+     if (!output) {
+       return;
+@@ -1144,6 +1196,11 @@
+       },
+     });
+   };
++  /** BOS-Patch: der Antwortfilter haengt Dateien aus {{file:...}} hier an die Antwort an. */
++  if (res) {
++    bosArtifactSinks.set(res, { artifactPromises, res, streamId, jobCreatedAt });
++  }
++  return toolEndCallback;
+ }
+ 
+ /**
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -31,6 +31,7 @@
+ let _langchain_core_singletons = require("@langchain/core/singletons");
+ let crypto = require("crypto");
+ const bosToolData = require("./bosToolData.cjs");
++const bosToolFiles = require("./bosToolFiles.cjs");
+ let _langchain_core_utils_function_calling = require("@langchain/core/utils/function_calling");
+ //#region src/tools/subagent/SubagentExecutor.ts
+ const ERROR_MESSAGE_MAX_CHARS = 200;
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -66222,6 +66222,14 @@
+ 				const hasPersistentUserConnections = !!userId && (this.userConnections.get(userId)?.size ?? 0) > 0;
+ 				if (!ephemeralConnection && hasPersistentUserConnections) await this.updateUserLastActivity(userId);
+ 				this.checkIdleConnections();
++				/** BOS-Patch tool-files: Dateien im Ergebnis werden Dateien des Chats, das Modell bekommt [FILE ...]. */
++				if (!requestBody?.conversationId) _librechat_data_schemas.logger.warn(`[bosToolFiles] no conversationId for ${serverName}/${toolName}; files are not stored`);
++				else await bosToolFiles.capture(result, {
++					user: user?.id ?? userId,
++					conversationId: requestBody.conversationId,
++					server: serverName,
++					tool: toolName
++				});
+ 				const toolResult = result;
+ 				const admittedMCPApps = mcpApps ?? librechat_data_provider.DEFAULT_MCP_APPS_POLICY;
+ 				const appCompatible = !rawConfig || !rawConfig.obo && !(!isDbSourced && mcpOptionsContainGraphTokenPlaceholder(rawConfig)) && getMissingRuntimeBodyPlaceholderFields(rawConfig).length === 0;
+@@ -137994,6 +138002,32 @@
+  *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
+  *  Platzhalter als Text. */
+ const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
++/** BOS-Patch tool-files: {{file:F-...}} oder {{file:<Dateiname>}} wird zu base64 der Datei, in der
++ *  Codeausfuehrung zum Pfad unter /mnt/data (Datei wird vorher in die Sandbox hochgeladen). */
++const bosToolFiles = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs");
++function bosCodeUploader(configurable, user) {
++	/** Im Werkzeuglauf steht kein Express-Request in configurable; uploadCodeEnvFile braucht davon nur
++	 *  req.user (Kopfzeile User-Id, Claims der Code-API). */
++	const req = configurable?.req ?? { user: { ...configurable?.user ?? {}, id: user } };
++	return async (doc) => {
++		const { uploadCodeEnvFile } = require("/app/api/server/services/Files/Code/crud.js");
++		const uploaded = await uploadCodeEnvFile({
++			req,
++			stream: require("fs").createReadStream(doc.diskPath),
++			filename: doc.name,
++			kind: "user",
++			id: user,
++			executionProfile: "default"
++		});
++		return {
++			id: uploaded.file_id,
++			resource_id: user,
++			storage_session_id: uploaded.storage_session_id,
++			name: uploaded.filename,
++			kind: "user"
++		};
++	};
++}
+ const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;

@@ -1,0 +1,65 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138103,6 +138103,54 @@
+ *  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
+ *  regulaer, statt mit "Recursion limit reached" abzubrechen und alles Gelesene zu verlieren. 0 = aus. */
+ const BOS_SUBAGENT_STEP_GUARD = Number(process.env.BOS_SUBAGENT_STEP_GUARD) || 0;
++/** BOS-Patch read-file-ref: Bild als Anhang fuer das Modell wie beim Lesen aus der Sandbox, Text bis
++ *  BOS_READ_FILE_TEXT_MAX Bytes als Inhalt, alles andere mit dem Hinweis auf Code. */
++const BOS_READ_FILE_TEXT_MAX = 100 * 1024;
++const BOS_READ_FILE_REF = /^\s*\{\{file:([^{}\n]+?)\}\}\s*$/;
++async function bosReadFileRef(tc, scope, req) {
++	let args = tc.args ?? {};
++	if (typeof args === "string") try {
++		args = JSON.parse(args);
++	} catch {
++		args = {};
++	}
++	const match = String(args.path ?? "").match(BOS_READ_FILE_REF);
++	if (!match) return errorResult(tc, "read_file takes one {{file:...}} as the whole path, for example {{file:F-1a2b3c}}; nothing was read.");
++	const key = match[1].trim();
++	let doc;
++	let buffer;
++	try {
++		doc = await bosToolFiles.resolve(key, scope);
++		if (!doc) return errorResult(tc, `Unknown file reference ${key}; nothing was read. Use only IDs from [FILE] lines of this chat or names of files in this chat.`);
++		buffer = await require("fs").promises.readFile(doc.diskPath);
++	} catch (error) {
++		_librechat_data_schemas.logger.error("[bosToolFiles] read_file", error);
++		return errorResult(tc, `File ${key} could not be read (${error.message}).`);
++	}
++	const mimeType = sniffImageMime(buffer);
++	if (mimeType && isCompleteImage(buffer, mimeType)) {
++		const filtered = filteredBinaryFileResult(tc, req, doc.name);
++		if (filtered != null) return filtered;
++		if (buffer.length > MAX_SANDBOX_INLINE_IMAGE_BYTES) return {
++			toolCallId: tc.id,
++			status: "success",
++			content: `Image ${doc.name} is ${buffer.length} bytes, over the ${MAX_SANDBOX_INLINE_IMAGE_BYTES}-byte inline limit. Downscale it in code (execute_code or bash_tool with {{file:${key}}}) and read the smaller copy.`
++		};
++		return buildImageArtifactResult(tc.id, doc.name, mimeType, buffer.length, buffer.toString("base64"));
++	}
++	if (buffer.length <= BOS_READ_FILE_TEXT_MAX && !buffer.includes(0)) {
++		let content = null;
++		try {
++			content = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
++		} catch {}
++		if (content != null) return filteredFileResult(tc, req, doc.name, content) ?? {
++			toolCallId: tc.id,
++			status: "success",
++			content: `File: ${doc.name} (${buffer.length} bytes)\n\n${content}`
++		};
++	}
++	return errorResult(tc, `${doc.name} (${doc.mime}, ${buffer.length} bytes) is neither an image nor text up to ${BOS_READ_FILE_TEXT_MAX} bytes; nothing was read. Process it in code (execute_code or bash_tool) with {{file:${key}}}.`);
++}
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
+@@ -138134,6 +138182,7 @@
+ 				continue;
+ 			}
+ 		}
++		/** BOS-Patch read-file-ref: read_file mit {{file:...}} liest die Datei des Chats direkt aus dem Dateispeicher.
+ 		*  Ueber die Sandbox kaeme sie erst nach einem Codeaufruf an, der sie dorthin hochlaedt. */
+ 		if (tc.name === "read_file" && text.includes("{{file:")) {
+ 			blocked.set(tc, await bosReadFileRef(tc, { user, conversationIds }, configurable?.req));

@@ -1,0 +1,83 @@
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -29,6 +29,7 @@
+ let _langchain_langgraph = require("@langchain/langgraph");
+ let _langchain_core_singletons = require("@langchain/core/singletons");
+ let crypto = require("crypto");
++const bosToolData = require("./bosToolData.cjs");
+ let _langchain_core_utils_function_calling = require("@langchain/core/utils/function_calling");
+ //#region src/tools/subagent/SubagentExecutor.ts
+ const ERROR_MESSAGE_MAX_CHARS = 200;
+@@ -1236,7 +1237,24 @@
+ 		};
+ 	}
+ 	async executeOnce(params, execution, executableConfig) {
+-		const { description, subagentType, threadId, parentToolCallId } = params;
++		const { subagentType, threadId, parentToolCallId } = params;
++		const bosScope = {
++			user: params.parentConfigurable?.user_id,
++			conversationId: params.parentConfigurable?.thread_id
++		};
++		/** Verweise bleiben im Auftrag stehen; die Zeilen setzt die Werkzeugausfuehrung ein (expandArgs). */
++		const describedData = await bosToolData.describeRefs(params.description, {
++			user: bosScope.user,
++			conversationIds: [bosScope.conversationId]
++		});
++		if (describedData.unknown.length > 0) return createSubagentFailure(`Subagent error: unknown data reference ${describedData.unknown.join("; ")}. Have the data fetched again.`);
++		/** Dateien: Verweise pruefen, Zeilen [FILE ...] der genannten und der juengsten Dateien anhaengen. */
++		const describedFiles = await bosToolFiles.describeRefs(describedData.text, {
++			user: bosScope.user,
++			conversationIds: [bosScope.conversationId]
++		});
++		if (describedFiles.unknown.length > 0) return createSubagentFailure(`Subagent error: unknown file reference ${describedFiles.unknown.join("; ")}. Use only IDs from [FILE] lines or names of files in this chat.`);
++		const description = describedFiles.text;
+ 		const childBreaker = params.breaker ?? this.resolveBreakerController();
+ 		const childSignal = this.composeChildSignal(childBreaker, params.signal);
+ 		const { parentToolCallId: executionSuffix } = execution.address;
+@@ -1600,7 +1618,23 @@
+ 		}
+ 		const childTerminalAt = Date.now();
+ 		if (result == null) throw new Error("Subagent completed without producing graph state.");
+-		const filteredContent = childPlan.kind === "graph" ? filterGraphSubagentResult(result, childPlan.resultAgentId) : filterSubagentResult(result.messages);
++		const subagentText = childPlan.kind === "graph" ? filterGraphSubagentResult(result, childPlan.resultAgentId) : filterSubagentResult(result.messages);
++		const filteredContent = await bosToolData.collect({
++			content: subagentText,
++			messages: result.messages,
++			...bosScope
++		}).catch((error) => {
++			console.error("[bosToolData] collect failed", error);
++			return subagentText;
++		}).then((content) => bosToolFiles.collect({
++			content,
++			messages: result.messages,
++			...bosScope,
++			parentToolCallId
++		})).catch((error) => {
++			console.error("[bosToolFiles] collect failed", error);
++			return subagentText;
++		});
+ 		if (!childAlreadyCompleted && this.hookRegistry?.hasHookFor("SubagentStop", currentHookSessionId) === true) await require_executeHooks.executeHooks({
+ 			registry: this.hookRegistry,
+ 			input: {
+@@ -2155,7 +2189,21 @@
+ 	if (result.message == null) return "Task completed";
+ 	return filterSubagentResult([result.message]);
+ }
++/** BOS-Patch: Schreibt ein Subagent seine Antwort und schliesst nach einem weiteren Werkzeugaufruf
++*  mit einem kurzen Satz ("siehe oben"), ginge die Antwort verloren. Ist der letzte Text kuerzer als
++*  1000 Zeichen, steht der laengste fruehere Text des Subagenten davor. */
+ function filterSubagentResult(messages) {
++	const last = filterLastSubagentText(messages);
++	if (last === "Task completed" || last.length >= 1000) return last;
++	let longest = "";
++	for (const message of messages) {
++		if (message._getType() !== "ai") continue;
++		const text = filterLastSubagentText([message]);
++		if (text !== "Task completed" && text.length > longest.length) longest = text;
++	}
++	return longest.length > last.length ? `${longest}\n\n${last}` : last;
++}
++function filterLastSubagentText(messages) {
+ 	for (let i = messages.length - 1; i >= 0; i--) {
+ 		if (messages[i]._getType() !== "ai") continue;
+ 		const content = messages[i].content;

@@ -450,6 +450,9 @@ interface:
   # Regular chat retention in hours under retentionMode: "all" (min: 1, max: 8760).
   # Defaults to the temporary chat retention policy when omitted.
   # generalChatRetention: 2160 # 90 days, independently of temporary chats
+  # Under retentionMode: "all" with generalChatRetention set, count that period from the chat's
+  # last message instead of its creation. Sending a message moves the whole chat's deadline.
+  # renewRetentionOnActivity: true
   # Existing stored deadlines are not migrated when these settings change.
   # Retention mode: "temporary" (default) applies expiry only to chats users mark temporary;
   # "all" applies expiry to all data types while keeping chats visible in history;

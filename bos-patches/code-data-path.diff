@@ -1,0 +1,11 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138303,6 +138303,8 @@
+ 			blocked.set(tc, errorResult(tc, `File references could not be resolved (${error.message}); nothing was run.`));
+ 			continue;
+ 		}
++		/** BOS-Patch code-data-path: ein abgeschriebener Pfad /mnt/data/D-....json wird wieder zum Verweis. */
++		if (JSON.stringify(tc.args ?? {}).includes("/mnt/data/D-") && isCodeSessionAwareToolCall(tc.name, configurable ?? {})) tc.args = bosToolData.dataPathRefs(tc.args);
+ 		if (!JSON.stringify(tc.args ?? {}).includes("{{data:")) continue;
+ 		try {
+ 			/** BOS-Patch code-data-file: in der Codeausfuehrung wird der Verweis zum Pfad einer JSON-Datei. */

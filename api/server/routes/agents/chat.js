@@ -21,6 +21,7 @@ const {
 } = require('~/server/middleware');
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const guardSubagentThreadTurn = require('~/server/middleware/validate/subagentThreadTurn');
+const renewConvoRetention = require('~/server/middleware/validate/renewConvoRetention');
 const AgentController = require('~/server/controllers/agents/request');
 const ResumeController = require('~/server/controllers/agents/resume');
 const addTitle = require('~/server/services/Endpoints/agents/title');
@@ -89,7 +90,7 @@ router.post('/resume', resumeController);
  * @param {express.Response} res - The response object, used to send back a response.
  * @returns {void}
  */
-router.post('/', controller);
+router.post('/', renewConvoRetention, controller);
 
 /**
  * @route POST /:endpoint (ephemeral agents)
@@ -99,6 +100,6 @@ router.post('/', controller);
  * @param {express.Response} res - The response object, used to send back a response.
  * @returns {void}
  */
-router.post('/:endpoint', controller);
+router.post('/:endpoint', renewConvoRetention, controller);
 
 module.exports = router;

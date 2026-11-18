@@ -1,0 +1,32 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138098,6 +138098,21 @@
+ 		};
+ 	};
+ }
++/** BOS-Patch code-data-file: laedt die Zeilen eines {{data:...}} als JSON-Datei in die Sandbox. */
++function bosCodeDataUploader(configurable, user) {
++	const upload = bosCodeUploader(configurable, user);
++	return async ({ name, content }) => {
++		const fs = require("fs");
++		const dir = await fs.promises.mkdtemp(require("path").join(require("os").tmpdir(), "bos-data-"));
++		const diskPath = require("path").join(dir, name);
++		try {
++			await fs.promises.writeFile(diskPath, content);
++			return await upload({ diskPath, name });
++		} finally {
++			await fs.promises.rm(dir, { recursive: true, force: true });
++		}
++	};
++}
+ const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
+ /** BOS-Patch subagent-round-guard: Ab diesem Schritt des Graphen (metadata.langgraph_step) fuehrt ein Subagent
+ *  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
+@@ -138290,6 +138305,7 @@
+ 		}
+ 		if (!JSON.stringify(tc.args ?? {}).includes("{{data:")) continue;
+ 		try {
++			/** BOS-Patch code-data-file: in der Codeausfuehrung wird der Verweis zum Pfad einer JSON-Datei. */
+ 			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
+ 			if (isCode && !user) throw new Error("no user for the code upload");
+ 			const { args, unknown, codeFiles } = await bosToolData.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeDataUploader(configurable, user) : null);

@@ -1,0 +1,156 @@
+--- a/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/SubagentTool.cjs
+@@ -44,14 +44,37 @@
+ 	description: SubagentToolDescription,
+ 	parameters: SubagentToolSchema
+ };
++/** BOS: Kurznamen statt Agenten-IDs. Das Modell schrieb IDs wie agent_bqFVwJV0dwKDSyqMnrIIC falsch ab
++ *  oder erfand welche; einen Namen wie "exchange" trifft es. Der Name kommt aus dem Agentennamen, bei
++ *  Gleichstand mit -2, -3, ...; der SubagentExecutor uebersetzt ihn zurueck in die ID. */
++function bosSubagentAliases(configs) {
++	const toType = /* @__PURE__ */ new Map();
++	const toAlias = /* @__PURE__ */ new Map();
++	const taken = new Set(configs.filter((c) => !String(c.type).startsWith("agent_")).map((c) => String(c.type)));
++	for (const c of configs) {
++		const type = String(c.type);
++		if (!type.startsWith("agent_")) continue;
++		const base = String(c.name ?? "").replace(/ß/g, "ss").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
++		let alias = base;
++		for (let n = 2; taken.has(alias); n++) alias = `${base}-${n}`;
++		taken.add(alias);
++		toType.set(alias, type);
++		toAlias.set(type, alias);
++	}
++	return { toType, toAlias };
++}
+ function buildSubagentToolParams(configs, options = {}) {
+-	const types = configs.map((c) => c.type);
++	const { toAlias } = bosSubagentAliases(configs);
++	const types = configs.map((c) => toAlias.get(String(c.type)) ?? c.type);
+ 	const hostArgs = require_hostArgs.buildSubagentHostArgProperties(configs);
+ 	const typeDescriptions = configs.map((c) => {
+ 		const summary = hostArgs.summaries.get(c.type);
+-		const line = `- "${c.type}" (${c.name}): ${c.description}`;
++		const line = `- "${toAlias.get(String(c.type)) ?? c.type}" (${c.name}): ${c.description}`;
+ 		return summary == null ? line : `${line} [optional ${summary}]`;
+ 	}).join("\n");
++	/** BOS: Nur die Kurznamen stehen im Schema. Mit den IDs in der Liste schrieb das Modell sie als Namen
++	 *  eines Arguments (agent_...: "<Auftrag>") statt description. Der SubagentExecutor nimmt IDs weiter an. */
++	const accepted = types;
+ 	return {
+ 		name: SubagentToolName,
+ 		schema: {
+@@ -64,7 +87,7 @@
+ 				},
+ 				subagent_type: {
+ 					type: "string",
+-					enum: types,
++					enum: accepted,
+ 					description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(", ")}.`
+ 				},
+ 				...options.background === true ? { run_in_background: {
+@@ -95,6 +118,7 @@
+ exports.SubagentToolDescription = SubagentToolDescription;
+ exports.SubagentToolName = SubagentToolName;
+ exports.SubagentToolSchema = SubagentToolSchema;
++exports.bosSubagentAliases = bosSubagentAliases;
+ exports.buildSubagentToolParams = buildSubagentToolParams;
+ exports.createSubagentToolDefinition = createSubagentToolDefinition;
+ 
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/SubagentExecutor.cjs
+@@ -1,5 +1,6 @@
+ const require_runStepResume = require("../runStepResume.cjs");
+ const require_SubagentReplay = require("./SubagentReplay.cjs");
++const require_SubagentTool = require("../SubagentTool.cjs");
+ const require_eagerEventExecution = require("../eagerEventExecution.cjs");
+ const require_hitl = require("../../types/hitl.cjs");
+ const require_approvalReview = require("../../hitl/approvalReview.cjs");
+@@ -447,6 +448,8 @@
+ 	resolveParentHandlerRegistry;
+ 	constructor(options) {
+ 		this.configs = options.configs;
++		/** BOS: Kurznamen aus SubagentTool.cjs zurueck in die Agenten-ID; alles danach sieht nur IDs. */
++		this.bosAliases = require_SubagentTool.bosSubagentAliases([...this.configs.values()]).toType;
+ 		this.parentSignal = options.parentSignal;
+ 		this.breakerScope = options.breakerScope;
+ 		this.hookRegistry = options.hookRegistry;
+@@ -490,7 +493,14 @@
+ 	getParentHandlerRegistry() {
+ 		return this.resolveParentHandlerRegistry?.();
+ 	}
++	bosType(type) {
++		return type == null ? type : this.bosAliases.get(type) ?? type;
++	}
+ 	executeInBackground(params) {
++		params = {
++			...params,
++			subagentType: this.bosType(params.subagentType)
++		};
+ 		if (this.taskConfig == null) return JSON.stringify({
+ 			status: "rejected",
+ 			message: "Background subagent execution is not enabled for this run."
+@@ -1033,7 +1043,7 @@
+ 		const inProcessSettledOutput = execution.settledOutput;
+ 		if (inProcessSettledOutput != null) {
+ 			const persistedSubagentType = getSubagentTypeFromArgs(inProcessSettledOutput.resolvedArgs);
+-			const subagentType = persistedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call);
++			const subagentType = this.bosType(persistedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call));
+ 			if (!isResumeExecutionCompatible(resumeExecution, subagentType, subagentType == null ? void 0 : this.configs.get(subagentType), persistedSubagentType != null)) return;
+ 			return deserializeToolOutput(inProcessSettledOutput);
+ 		}
+@@ -1042,7 +1052,7 @@
+ 		let marker = resumeCheckpoint?.marker;
+ 		let messages = resumeCheckpoint?.messages ?? [];
+ 		let persistedSubagentType = getSubagentTypeFromArgs(marker?.settledOutput?.resolvedArgs);
+-		let subagentType = persistedSubagentType ?? resumeExecution?.subagentType ?? getSubagentType(call);
++		let subagentType = this.bosType(persistedSubagentType ?? resumeExecution?.subagentType ?? getSubagentType(call));
+ 		let executableConfig = subagentType == null ? void 0 : this.configs.get(subagentType);
+ 		if (!isResumeExecutionCompatible(resumeExecution, subagentType, executableConfig, persistedSubagentType != null)) {
+ 			this.executions.remove(execution);
+@@ -1054,7 +1064,7 @@
+ 			marker = getSubagentCheckpointMarker(messages, parentToolCallId);
+ 			persistedSubagentType = getSubagentTypeFromArgs(marker?.settledOutput?.resolvedArgs);
+ 			if (persistedSubagentType != null) {
+-				subagentType = persistedSubagentType;
++				subagentType = this.bosType(persistedSubagentType);
+ 				executableConfig = this.configs.get(subagentType);
+ 			}
+ 			if (!isResumeExecutionCompatible(resumeExecution, subagentType, executableConfig, persistedSubagentType != null)) {
+@@ -1090,10 +1100,10 @@
+ 		const resolvedDescription = getSubagentDescriptionFromArgs(settled.resolvedArgs);
+ 		const boundInvocation = execution.invocation;
+ 		if (boundInvocation != null && resolvedDescription != null && resolvedDescription !== boundInvocation.description) return;
+-		const resolvedHostArgsDigest = settled.resolvedArgs == null ? void 0 : getHostArgsDigestFromArgs(this.configs.get(resolvedSubagentType ?? execution.binding?.subagentType ?? ""), settled.resolvedArgs);
++		const resolvedHostArgsDigest = settled.resolvedArgs == null ? void 0 : getHostArgsDigestFromArgs(this.configs.get(this.bosType(resolvedSubagentType ?? execution.binding?.subagentType ?? "")), settled.resolvedArgs);
+ 		if (boundInvocation != null && settled.resolvedArgs != null && resolvedHostArgsDigest !== boundInvocation.hostArgsDigest) return;
+ 		const description = boundInvocation?.description ?? resolvedDescription ?? getSubagentDescriptionFromArgs(call.args) ?? "No task description provided";
+-		const subagentType = resolvedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call);
++		const subagentType = this.bosType(resolvedSubagentType ?? execution.binding?.subagentType ?? getSubagentType(call));
+ 		const executableConfig = subagentType == null ? void 0 : this.configs.get(subagentType);
+ 		const configId = resolvedSubagentType == null ? execution.binding?.configId ?? getSubagentDefinitionId(executableConfig) ?? resumeExecution?.configId : getSubagentDefinitionId(executableConfig);
+ 		if (subagentType == null) return;
+@@ -1158,9 +1168,13 @@
+ 		})] }, activeChildRun.checkpointNodeId);
+ 	}
+ 	execute(params) {
++		params = {
++			...params,
++			subagentType: this.bosType(params.subagentType)
++		};
+ 		const executableConfig = this.configs.get(params.subagentType);
+ 		if (executableConfig == null) {
+-			const available = [...this.configs.keys()].join(", ");
++			const available = [...this.configs.keys()].filter((type) => !String(type).startsWith("agent_")).concat([...this.bosAliases.keys()]).join(", ");
+ 			return Promise.resolve(createSubagentFailure(`Error: Unknown subagent type "${params.subagentType}". Available types: ${available}`));
+ 		}
+ 		const hostArgResult = require_hostArgs.resolveSubagentHostArgs(executableConfig, params.hostArgs);
+@@ -1198,7 +1212,7 @@
+ 		return this.composeChildSignal(scope?.controller ?? this.resolveBreakerController(), config.signal);
+ 	}
+ 	createReplayResolutionError(call, config, execution, signal, error) {
+-		const selectedType = execution.binding?.subagentType ?? execution.resumeExecution?.subagentType ?? getSubagentType(call);
++		const selectedType = this.bosType(execution.binding?.subagentType ?? execution.resumeExecution?.subagentType ?? getSubagentType(call));
+ 		const threadId = config.configurable?.thread_id;
+ 		return new require_diagnostics.SubagentResolutionError("identity", this.createResolutionFailure("identity", {
+ 			subagentType: selectedType == null ? "unknown" : this.configs.get(selectedType)?.type ?? "unknown",

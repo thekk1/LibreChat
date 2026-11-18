@@ -189,7 +189,7 @@ const userSchema: Schema<IUser> = new Schema<IUser>(
       type: {
         memories: {
           type: Boolean,
-          default: true,
+          default: false,
         },
         statefulCodeEnvironment: {
           type: String,

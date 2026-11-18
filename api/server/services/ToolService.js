@@ -73,6 +73,7 @@ const {
   getTransactionsConfig,
   checkToolRolePermission,
   resolveToolRolePermissions,
+  MCPOAuthHandler,
   splitAssistantMCPToolResult,
   appendAssistantMCPAppArtifact,
   resolveMCPClientCapabilityProfile,
@@ -138,13 +139,17 @@ const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const {
+  findToken,
+  createToken,
+  updateToken,
+  deleteTokens,
   findPluginAuthsByKeys,
   getRoleByName,
   setConvoLaneGit,
   getConvoLaneContext,
   reserveConvoLaneGitSeq,
 } = require('~/models');
-const { getFlowStateManager, getMCPServersRegistry } = require('~/config');
+const { getMCPManager, getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
 
 const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
@@ -818,6 +823,65 @@ const isBuiltInTool = (toolName) =>
       nativeTools.has(toolName),
   );
 
+/** BOS patch (mcp-credentials): the result of a subagent that must not start, per request and agent. */
+function noteSubagentNotStarted(req, agentId, result) {
+  req.bosSubagentNotStarted ??= new Map();
+  req.bosSubagentNotStarted.set(agentId, result);
+}
+
+/** BOS patch (mcp-precheck): a cheap read-only call per server, made before a subagent starts. */
+const MCP_PRECHECKS = {
+  trac: { tool: 'get_server_time' },
+  gitea: { tool: 'get_me' },
+  jenkins: { tool: 'get_all_views' },
+  portainer: { tool: 'systemInfo' },
+  nextcloud: { tool: 'nc_auth_check_status' },
+  exchange: { tool: 'list_folders', args: () => ({ depth: 1 }) },
+  'jira-mercedes': {
+    tool: 'jira_get_user_profile',
+    args: (vars) => ({ user_identifier: vars?.ATLASSIAN_EMAIL }),
+  },
+};
+const MCP_PRECHECK_TIMEOUT_MS = 15000;
+const MCP_PRECHECK_PASSED_MS = 300000;
+const mcpPrecheckPassed = new Map();
+
+/** The text of a tool result, whatever content format the provider gets. */
+function mcpResultText(result) {
+  const content = Array.isArray(result) ? result[0] : result;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part === 'string' ? part : part?.text ?? '')).join('');
+  }
+  return JSON.stringify(content ?? '');
+}
+
+/** Blocks only on a clear sign-in failure; anything else (timeout, 403, no answer) lets the subagent run. */
+function mcpPrecheckVerdict(serverName, text) {
+  if (serverName === 'nextcloud') {
+    const status = /"status"\s*:\s*"([a-z_]+)"/.exec(text)?.[1];
+    if (status === 'not_initiated' || status === 'revoked' || status === 'pending' || status === 'login_required') {
+      return 'login';
+    }
+  }
+  const head = text.slice(0, 400);
+  const failed = /^\W*(error|failed)|"error"\s*:|\berr:/i.test(head);
+  const rejected = /auth_failed|\b401\b|unauthori[sz]ed|authentication failed|invalid credentials/i.test(head);
+  return failed && rejected ? 'rejected' : 'ok';
+}
+
+/** BOS patch (subagent-oauth): subagents start at the same time and read the same content length.
+ *  Each sign-in step gets its own index, otherwise the later step replaces the earlier one. */
+const authStepIndexes = new Map();
+function reserveAuthStepIndexes(streamId, contentLength, count) {
+  const start = Math.max(contentLength, authStepIndexes.get(streamId) ?? 0);
+  authStepIndexes.set(streamId, start + count);
+  setTimeout(() => authStepIndexes.delete(streamId), 3600000).unref();
+  return start;
+}
+
 /**
  * Loads only tool definitions without creating tool instances.
  * This is the efficient path for event-driven mode where tools are loaded on-demand.
@@ -857,6 +921,7 @@ async function loadToolDefinitionsWrapper({
   signal,
   upstreamTokenProvider: suppliedUpstreamTokenProvider,
   upstreamTokenProviderResolver,
+  skipMCPOAuthWait = false,
 }) {
   if (!agent.tools || agent.tools.length === 0) {
     return { toolDefinitions: [] };
@@ -1043,6 +1108,7 @@ async function loadToolDefinitionsWrapper({
 
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
+  const pendingCredentialServers = new Set();
   const pendingOAuthServers = new Set();
   const pendingOAuthStarts = new Map();
   const initializationOAuth = createMCPInitializationOAuthPrompts({
@@ -1170,6 +1236,7 @@ async function loadToolDefinitionsWrapper({
       logger.warn('[Tool Definitions] Skipping one MCP server with missing user configuration', {
         missingVariableCount: missingUserVars.length,
       });
+      pendingCredentialServers.add(serverName);
       return null;
     }
 
@@ -1375,7 +1442,58 @@ async function loadToolDefinitionsWrapper({
     pendingOAuthStarts.set(serverName, pendingOAuthStart);
   }
 
-  if (
+  /** BOS-Patch (LibreChat #17306): a subagent connects its MCP servers after the parent streamed
+   *  content. Its sign-in step goes to the first free index of the parent's content instead of
+   *  index 0, which the parent's output holds and where the client drops the step. */
+  let oauthIndexOffset = 0;
+  let subagentSkipsOAuth = false;
+  if (pendingOAuthServers.size > 0 && skipMCPOAuthWait) {
+    let parentContentLength;
+    try {
+      const parts = streamId
+        ? await GenerationJobManager.jobStore?.getContentParts?.(streamId, jobCreatedAt)
+        : null;
+      parentContentLength = Array.isArray(parts?.content) ? parts.content.length : undefined;
+    } catch (error) {
+      logger.warn('[Tool Definitions] Failed to read the parent content for MCP OAuth', error);
+    }
+    if (typeof parentContentLength === 'number') {
+      oauthIndexOffset = reserveAuthStepIndexes(streamId, parentContentLength, pendingOAuthServers.size);
+      logger.info(`[Tool Definitions] Subagent MCP OAuth step at parent content index ${oauthIndexOffset}`);
+    } else {
+      subagentSkipsOAuth = true;
+    }
+  }
+
+  if (subagentSkipsOAuth) {
+    /** Fallback: leave the tools of servers pending OAuth out and cancel the flow tool loading
+     *  started, like POST /api/mcp/oauth/cancel. While it is pending, the MCP servers panel shows
+     *  the server as connecting, without a sign-in button. */
+    logger.info(
+      `[Tool Definitions] MCP OAuth required for ${pendingOAuthServers.size} server(s); not waiting, their tools are left out`,
+    );
+    for (const serverName of pendingOAuthServers) {
+      try {
+        const flowId = MCPOAuthHandler.generateFlowId(req.user.id, serverName, getTenantId());
+        const flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
+        if (flowState?.status === 'PENDING') {
+          await MCPOAuthHandler.failFlowAndDeleteStateMapping(
+            flowId,
+            flowState,
+            flowManager,
+            'Subagent does not wait for OAuth',
+          );
+        }
+      } catch (error) {
+        logger.warn('[Tool Definitions] Failed to cancel a pending MCP OAuth flow', error);
+      }
+    }
+    noteSubagentNotStarted(
+      req,
+      agent.id,
+      `The subagent did not start: the sign-in to ${Array.from(pendingOAuthServers).join(', ')} is missing. Tell the user to ask again and to sign in with the button that then appears. Do not start this subagent again in this turn.`,
+    );
+  } else if (
     shouldAwaitOAuthSignIn({
       res,
       streamId,
@@ -1390,7 +1508,7 @@ async function loadToolDefinitionsWrapper({
     );
 
     const oauthWaitPromises = serverNames.map((serverName, index) => {
-      const oauthPrompt = initializationOAuth.forServer(serverName, index);
+      const oauthPrompt = initializationOAuth.forServer(serverName, oauthIndexOffset + index);
       return oauthPrompt.run(async () => {
         try {
           const pendingOAuthStart = await getPendingOAuthStartForEmit(serverName);
@@ -1441,6 +1559,17 @@ async function loadToolDefinitionsWrapper({
       .filter((result) => result.success)
       .map((result) => result.serverName);
 
+    /** BOS patch (mcp-credentials): without the sign-in the subagent has no tools of this server. */
+    const failedServers = results.filter((result) => !result.success).map((result) => result.serverName);
+    if (failedServers.length > 0 && skipMCPOAuthWait) {
+      logger.info('[Tool Definitions] MCP OAuth not completed; subagent does not start');
+      noteSubagentNotStarted(
+        req,
+        agent.id,
+        `The subagent did not start: the sign-in to ${failedServers.join(', ')} was not completed. Tell the user to ask again and to sign in with the button that then appears. Do not start this subagent again in this turn.`,
+      );
+    }
+
     if (successfulServers.length > 0) {
       logger.info(
         `[Tool Definitions] Reloading tools after OAuth for ${successfulServers.length} server(s)`,
@@ -1477,6 +1606,104 @@ async function loadToolDefinitionsWrapper({
       mcpToolAliases = reloadResult.mcpToolAliases;
       mcpResolution = reloadResult.mcpResolution;
       oauthActionToolNames = reloadResult.oauthActionToolNames;
+    }
+  }
+
+  /** BOS patch (mcp-credentials): LibreChat leaves out a server without the user's variables and starts
+   *  the subagent anyway, which only finds out that its tools are missing after a model call. Note
+   *  the result here; initialize.js ends the subagent with it before the model runs. */
+  if (pendingCredentialServers.size > 0 && skipMCPOAuthWait) {
+    const links = Array.from(pendingCredentialServers).map(
+      (serverName) =>
+        `[Zugangsdaten für ${serverName} hinterlegen](${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)})`,
+    );
+    logger.info('[Tool Definitions] MCP user variables missing; subagent does not start');
+    noteSubagentNotStarted(
+      req,
+      agent.id,
+      `The subagent did not start: the user has not stored the credentials it needs. Tell the user and give them this link unchanged: ${links.join(', ')}. After saving they can ask again. Do not start this subagent again in this turn.`,
+    );
+  }
+
+  /** BOS patch (mcp-precheck): a subagent whose server rejects the stored sign-in, or wants a second
+   *  login like Nextcloud, only finds out after model calls. Ask the server before the model runs. */
+  if (skipMCPOAuthWait && !req.bosSubagentNotStarted?.has(agent.id)) {
+    const precheckServers = getMCPServerNamesFromTools(defsFilteredTools, mcpServerNames);
+    for (const serverName of precheckServers) {
+      const precheck = MCP_PRECHECKS[serverName];
+      const passedKey = `${req.user.id}:${serverName}`;
+      if (!precheck || (mcpPrecheckPassed.get(passedKey) ?? 0) > Date.now()) {
+        continue;
+      }
+      const vars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+      const callPrecheckTool = async (toolName, toolArguments) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), MCP_PRECHECK_TIMEOUT_MS);
+        try {
+          const result = await getMCPManager().callTool({
+            serverName,
+            serverConfig:
+              configServers?.[serverName] ??
+              (await getMCPServersRegistry().getServerConfig(serverName, req.user.id, configServers)),
+            toolName,
+            provider: agent.provider,
+            toolArguments,
+            options: { signal: controller.signal },
+            user: req.user,
+            requestBody: runtimeRequestBody,
+            customUserVars: vars,
+            flowManager,
+            tokenMethods: { findToken, createToken, updateToken, deleteTokens },
+            upstreamTokenProvider,
+            upstreamTokenProviderResolver,
+            oboIdentityContext,
+          });
+          return mcpResultText(result);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      try {
+        let answered = true;
+        const text = await callPrecheckTool(precheck.tool, precheck.args?.(vars) ?? {}).catch((error) => {
+          answered = false;
+          return `Error: ${error?.message ?? ''}`;
+        });
+        const verdict = mcpPrecheckVerdict(serverName, text);
+        logger.info(`[Tool Definitions] MCP precheck ${serverName}: ${verdict}${answered ? '' : ' (no answer)'}`);
+        if (verdict === 'ok') {
+          if (answered) {
+            mcpPrecheckPassed.set(passedKey, Date.now() + MCP_PRECHECK_PASSED_MS);
+          }
+          continue;
+        }
+        if (verdict === 'login') {
+          const provision = await callPrecheckTool('nc_auth_provision_access', {});
+          const loginUrl = /"login_url"\s*:\s*"(https?:[^"\s]+)"/.exec(provision)?.[1];
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            loginUrl
+              ? `The subagent did not start: the user has not logged in to Nextcloud yet. Tell the user and give them this link unchanged: [In Nextcloud anmelden](${loginUrl}). After logging in they can ask again. Do not start this subagent again in this turn.`
+              : 'The subagent did not start: the login to Nextcloud is not finished. Tell the user to finish it in the browser and to ask again. Do not start this subagent again in this turn.',
+          );
+        } else if (vars) {
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            `The subagent did not start: the server ${serverName} rejected the stored credentials. Tell the user and give them this link unchanged: [Zugangsdaten für ${serverName} korrigieren](${process.env.DOMAIN_CLIENT}/mcp-zugang/index.html?server=${encodeURIComponent(serverName)}). After saving they can ask again. Do not start this subagent again in this turn.`,
+          );
+        } else {
+          noteSubagentNotStarted(
+            req,
+            agent.id,
+            `The subagent did not start: the server ${serverName} rejected the sign-in. Tell the user to disconnect and connect ${serverName} again in the side panel "MCP servers" and to ask again. Do not start this subagent again in this turn.`,
+          );
+        }
+        break;
+      } catch (error) {
+        logger.info(`[Tool Definitions] MCP precheck ${serverName}: no answer, subagent starts`);
+      }
     }
   }
 
@@ -1653,6 +1880,7 @@ async function loadAgentTools({
   accessibleMcpServerNames,
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
+  skipMCPOAuthWait = false,
 }) {
   if (definitionsOnly) {
     try {
@@ -1672,6 +1900,7 @@ async function loadAgentTools({
         signal,
         upstreamTokenProvider,
         upstreamTokenProviderResolver,
+        skipMCPOAuthWait,
       });
     } catch (error) {
       if (

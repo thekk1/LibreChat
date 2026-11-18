@@ -1,0 +1,13 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138099,6 +138099,10 @@
+ 	};
+ }
+ const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
++/** BOS-Patch subagent-round-guard: Ab diesem Schritt des Graphen (metadata.langgraph_step) fuehrt ein Subagent
++*  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
++*  regulaer, statt mit "Recursion limit reached" abzubrechen und alles Gelesene zu verlieren. 0 = aus. */
++const BOS_SUBAGENT_STEP_GUARD = Number(process.env.BOS_SUBAGENT_STEP_GUARD) || 0;
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {

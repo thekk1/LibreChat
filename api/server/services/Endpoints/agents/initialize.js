@@ -149,6 +149,7 @@ function createToolLoader(
   jobCreatedAt,
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
+  skipMCPOAuthWait = false,
 ) {
   /**
    * @param {object} params
@@ -194,6 +195,7 @@ function createToolLoader(
         accessibleMcpServerNames,
         upstreamTokenProvider,
         upstreamTokenProviderResolver,
+        skipMCPOAuthWait,
       });
     } catch (error) {
       if (isFatalAgentInitializationError(error, { signal }) || isContentFilterError(error)) {
@@ -1420,6 +1422,9 @@ const initializeClientWithProvider = async ({
             req,
             res,
             agent: routedAgent,
+            /** BOS-Patch (LibreChat #17306): A subagent does not wait for MCP OAuth: its login step
+             *  would land on the parent's content index already held by the parent's output, so the
+             *  user never sees the link while the run waits for it. */
             loadTools: createToolLoader(
               req,
               res,
@@ -1429,6 +1434,7 @@ const initializeClientWithProvider = async ({
               jobCreatedAt,
               upstreamTokenProvider,
               upstreamTokenProviderResolver,
+              true,
             ),
             requestFiles,
             authorizedRunFiles: getAuthorizedRunFileSnapshot({
@@ -1525,7 +1531,7 @@ const initializeClientWithProvider = async ({
   }) => {
     throwIfAborted(context.signal);
     const agent = await waitForAbort(db.getAgentWithVersionCount({ id: agentId }), context.signal);
-    return initializeLoadedSubagent({
+    const config = await initializeLoadedSubagent({
       agent,
       agentId,
       configId,
@@ -1534,6 +1540,13 @@ const initializeClientWithProvider = async ({
       codeFlags,
       codeWorkspaceUnavailable,
     });
+    /** BOS patch (mcp-credentials): ends the subagent with this result before its first model call. */
+    const notStarted = req.bosSubagentNotStarted?.get(agentId);
+    if (notStarted) {
+      req.bosSubagentNotStarted.delete(agentId);
+      throw Object.assign(new Error('Subagent did not start'), { bosSubagentResult: notStarted });
+    }
+    return config;
   };
 
   const buildLazySubagentDescriptors = async (agent, depth = 0, ancestors = new Set()) => {

@@ -89,6 +89,143 @@ const {
   invalidateCachedTools,
 } = require('./Config');
 const { getLogStores } = require('~/cache');
+
+/**
+ * BOS-Patch tool-budget: begrenzt die Aufrufe der Werkzeuge eines MCP-Servers. BOS_TOOL_BUDGET nennt je
+ * Server die Grenze je Subagenten-Lauf und optional die Grenze je Benutzernachricht ueber alle Laeufe
+ * ("browse:5:10", mehrere durch Komma). Ein viertes Feld nennt Werkzeuge des Servers, die nicht zaehlen
+ * ("nextcloud:15:30:nc_office_copy_file_to_chat", mehrere durch "+"). Danach liefert jedes Werkzeug des Servers nur noch die
+ * Aufforderung, mit dem Gelesenen zu antworten; so endet der Lauf, statt am recursion_limit abzubrechen
+ * und alles Gelesene zu verlieren. Der Lauf ist die subagentRunId aus dem executionContext des
+ * Subagenten, sonst die run_id; die Nachricht ist die rootRunId, sonst ebenfalls die run_id. Zur Grenze
+ * je Nachricht zaehlen nur Aufrufe, die die Grenze je Lauf durchlaesst.
+ */
+const bosToolBudgets = new Map(
+  (process.env.BOS_TOOL_BUDGET || '')
+    .split(',')
+    .map((entry) => entry.trim().split(':'))
+    .filter(([server, limit]) => server && Number(limit) > 0)
+    .map(([server, limit, total, free]) => [
+      server,
+      {
+        limit: Number(limit),
+        total: Number(total) > 0 ? Number(total) : 0,
+        free: new Set((free || '').split('+').filter(Boolean)),
+      },
+    ]),
+);
+const bosToolBudgetCounts = new Map();
+function bosToolBudgetCount(key, now) {
+  const entry = bosToolBudgetCounts.get(key) ?? { count: 0, at: now };
+  entry.count += 1;
+  entry.at = now;
+  bosToolBudgetCounts.set(key, entry);
+  return entry.count;
+}
+function bosToolBudgetExceeded(serverName, config, toolName) {
+  const budget = bosToolBudgets.get(serverName);
+  if (!budget || budget.free.has(toolName)) {
+    return null;
+  }
+  const executionContext = config?.configurable?.executionContext;
+  const ancestry = executionContext?.ancestry;
+  const fallbackKey = config?.metadata?.run_id ?? config?.configurable?.run_id;
+  const runKey =
+    (Array.isArray(ancestry) && ancestry.length > 0
+      ? ancestry[ancestry.length - 1]?.subagentRunId
+      : undefined) ?? fallbackKey;
+  const rootKey = executionContext?.rootRunId ?? fallbackKey;
+  if (!runKey) {
+    return null;
+  }
+  const now = Date.now();
+  for (const [oldKey, old] of bosToolBudgetCounts) {
+    if (now - old.at > 3600000) {
+      bosToolBudgetCounts.delete(oldKey);
+    }
+  }
+  const runCount = bosToolBudgetCount(`${serverName}:run:${runKey}`, now);
+  if (runCount > budget.limit) {
+    logger.info(`[tool-budget] ${serverName}: call ${runCount} over budget ${budget.limit} (run ${runKey})`);
+    return (
+      `Tool budget exhausted: this task allows at most ${budget.limit} calls of these tools and all are used. ` +
+      'Do not call any more tools. Answer now with what you have read so far, and say what is missing.'
+    );
+  }
+  const rootCount =
+    budget.total > 0 && rootKey ? bosToolBudgetCount(`${serverName}:root:${rootKey}`, now) : 0;
+  if (budget.total > 0 && rootCount > budget.total) {
+    logger.info(
+      `[tool-budget] ${serverName}: call ${rootCount} over budget ${budget.total} per message (run ${runKey})`,
+    );
+    return (
+      `Tool budget exhausted: this question allows at most ${budget.total} calls of these tools across all ` +
+      'requests, and all are used. Do not call any more tools. Answer now with what you have read so far, ' +
+      'and say what is missing.'
+    );
+  }
+  return null;
+}
+
+/**
+ * BOS-Patch mcp-secret-mask: ersetzt in den Ergebnissen aller MCP-Werkzeuge Werte, die nach
+ * Passwort, Secret, Token oder Schluessel aussehen, durch BOS_SECRET_MARK: Optionen
+ * (-Dimap_pass=..., -Dserver_secret=...), JSON-Felder ("password": "..."), Umgebungsvariablen
+ * (DB_PASSWORD=...) und Werte "unencrypted:...". Ein Aufruf, dessen Argumente die Marke enthalten,
+ * wird abgewiesen: Ein Subagent schriebe sonst eine gelesene Konfiguration mit der Marke statt des
+ * echten Werts zurueck.
+ */
+const BOS_SECRET_MARK = '***masked***';
+const BOS_SECRET_WORDS = 'pass(?:wd|word)?|pwd|secret|token|credential|api_?key|private_?key';
+const BOS_SECRET_PATTERNS = [
+  [new RegExp(`(-D[\\w.\\-]*?(?:${BOS_SECRET_WORDS})[\\w.\\-]*=)(?:"[^"]*"|[^\\s"\\\\,;<]+)`, 'gi'), `$1${BOS_SECRET_MARK}`],
+  [
+    /("[\w.\-]*(?:password|passwd|pwd|secret|api_?key|private_?key|access_?token|refresh_?token|auth_?token)[\w.\-]*"\s*:\s*")((?:[^"\\]|\\.)*)"/gi,
+    `$1${BOS_SECRET_MARK}"`,
+  ],
+  [
+    /(\\"[\w.\-]*(?:password|passwd|pwd|secret|api_?key|private_?key|access_?token|refresh_?token|auth_?token)[\w.\-]*\\"\s*:\s*\\")((?:[^"\\]|\\[^"])*)\\"/gi,
+    `$1${BOS_SECRET_MARK}\\"`,
+  ],
+  [/\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY)[A-Z0-9_]*=)[^\s"\\,;<]+/g, `$1${BOS_SECRET_MARK}`],
+  [/(unencrypted:)[^\s"\\,;<]+/g, `$1${BOS_SECRET_MARK}`],
+];
+function bosMaskString(text) {
+  let out = text;
+  for (const [re, rep] of BOS_SECRET_PATTERNS) {
+    out = out.replace(re, (...m) => {
+      const value = m[0].slice(m[1].length).replace(/\\?"$/, '');
+      if (value === BOS_SECRET_MARK || value === '' || /^\$\{[^}]*\}$|^%[^%]*%$/.test(value ?? '')) {
+        return m[0];
+      }
+      return rep.replace(/\$1/g, m[1]);
+    });
+  }
+  return out;
+}
+function bosMaskSecrets(value, depth = 0) {
+  if (typeof value === 'string') {
+    return bosMaskString(value);
+  }
+  if (depth > 6 || value == null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => bosMaskSecrets(v, depth + 1));
+  }
+  if (typeof value === 'object' && typeof value.text === 'string') {
+    return { ...value, text: bosMaskString(value.text) };
+  }
+  return value;
+}
+function bosArgumentsMasked(toolArguments) {
+  try {
+    const raw = typeof toolArguments === 'string' ? toolArguments : JSON.stringify(toolArguments);
+    return typeof raw === 'string' && raw.includes(BOS_SECRET_MARK);
+  } catch {
+    return false;
+  }
+}
 const {
   clearMCPAuthorizationFenceRetry,
   persistMCPAuthorizationFenceRetry,
@@ -1293,6 +1430,19 @@ function createToolInstance({
 
   /** @type {(toolArguments: Object | string, config?: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolArguments, config) => {
+    const bosBudgetNote = bosToolBudgetExceeded(serverName, config, toolName);
+    if (bosBudgetNote) {
+      return [bosBudgetNote, null];
+    }
+    if (bosArgumentsMasked(toolArguments)) {
+      logger.info(`[secret-mask] ${serverName}: refused ${toolName}, arguments contain the mask`);
+      return [
+        `Refused: the input contains ${BOS_SECRET_MARK}, a secret value the system hid when it was read. ` +
+          'It cannot be written back. Change only parts without hidden values, or tell the user to make ' +
+          'the change in the system itself.',
+        null,
+      ];
+    }
     const effectiveUser = config?.configurable?.user ?? capturedUser;
     const permissionUser = effectiveUser;
     /** @type {string | undefined} */
@@ -1369,7 +1519,7 @@ function createToolInstance({
        * is required for OBO since the grant sends the access token to the IdP
        * as the jwt-bearer assertion.
        */
-      return await oauthPrompt.run(() =>
+      const bosResult = await oauthPrompt.run(() =>
         invokeTool(mcpManager, {
           scheduledBearerInvocation,
           scheduledMCPInvocation,
@@ -1417,6 +1567,9 @@ function createToolInstance({
           mcpApps: capturedMCPApps,
         }),
       );
+      return Array.isArray(bosResult)
+        ? [bosMaskSecrets(bosResult[0]), ...bosResult.slice(1)]
+        : bosMaskSecrets(bosResult);
     } catch (error) {
       /** A user Stop aborts every in-flight call at once, and that rejection is
        *  the cancellation working, so it must not reach error-level operational

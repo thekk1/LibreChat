@@ -1,0 +1,23 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -128586,10 +128586,19 @@
+ 		if (types == null) continue;
+ 		const value = Object.getOwnPropertyDescriptor(input, field)?.value;
+ 		if (!types.some((type) => typeChecks[type](value))) invalid.push(`${safeName(field)} (expected ${types.join(" or ")})`);
++		/** BOS-Patch validation-feedback: enum mit den erlaubten Werten nennen; nur Werte aus dem Schema */
++		else if (Array.isArray(property.enum) && !property.enum.includes(value)) invalid.push(`${safeName(field)} (allowed: ${property.enum.slice(0, MAX_FIELDS).map((v) => safeName(String(v))).join(", ")})`);
+ 	}
+ 	const invalidTypes = invalid.length ? ` Invalid field types: ${invalid.join(", ")}.` : "";
++	/** BOS-Patch validation-feedback: undeklarierte Argumente zaehlen und die deklarierten nennen; nur Namen aus dem Schema, keine Eingabe */
++	const properties = schema != null && typeof schema === "object" && schema.properties != null && typeof schema.properties === "object" ? schema.properties : null;
++	let undeclared = "";
++	if (properties != null && input != null && typeof input === "object" && !Array.isArray(input)) {
++		const count = Object.keys(input).filter((key) => !Object.prototype.hasOwnProperty.call(properties, key)).length;
++		if (count > 0) undeclared = ` ${count} undeclared argument(s) passed. Declared arguments: ${Object.keys(properties).slice(0, 2 * MAX_FIELDS).map(safeName).join(", ") || "none"}.`;
++	}
+ 	const polling = canCheckBackground && input != null && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "background_task_id") ? " To inspect an existing background task, call check_background_task with background_task_id." : "";
+-	return `Tool "${safeName(toolName)}" input failed schema validation.${missing}${invalidTypes} Use this tool's declared arguments.${polling}`;
++	return `Tool "${safeName(toolName)}" input failed schema validation.${missing}${invalidTypes}${undeclared} Use this tool's declared arguments.${polling}`;
+ }
+ //#endregion
+ //#region src/telemetry/tools.ts

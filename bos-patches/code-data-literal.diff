@@ -1,0 +1,78 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138151,6 +138151,75 @@
+ 	}
+ 	return errorResult(tc, `${doc.name} (${doc.mime}, ${buffer.length} bytes) is neither an image nor text up to ${BOS_READ_FILE_TEXT_MAX} bytes; nothing was read. Process it in code (execute_code or bash_tool) with {{file:${key}}}.`);
+ }
++/** BOS-Patch code-data-literal: Ein Codeaufruf (execute_code, bash_tool, create_file, write_file, edit_file), dessen Text eine Datenstruktur
++ *  ueber BOS_CODE_LITERAL_MAX Zeichen mit mindestens 20 Schluesseln ("name": oder 'name':) enthaelt, laeuft
++ *  nicht: Das Modell hat Werkzeugergebnisse abgetippt, statt {{toolNturnM}}, einen Daten- oder Dateiverweis
++ *  zu verwenden. Die Meldung nennt diese Verweise nur mit Worten: Ein Dateiverweis darin wuerde ersetzt. Geprueft wird der Text, wie das Modell ihn schrieb: Was das SDK fuer {{toolNturnM}}
++ *  eingesetzt hat, zaehlt nicht. Dieselben Daten laufen beim zweiten Mal (Daten aus der Anfrage des Nutzers). */
++const BOS_CODE_LITERAL_MAX = Number(process.env.BOS_CODE_LITERAL_MAX) || 8192;
++const BOS_CODE_LITERAL_KEY = /["'][^"'\n]{1,64}["']\s*:/g;
++const BOS_CODE_LITERAL_KEYS_MIN = 20;
++/** Dateiwerkzeuge der Sandbox: Daten in einer Datei abzulegen und sie im Code zu lesen, ist derselbe Umweg. */
++const BOS_CODE_LITERAL_FILE_TOOLS = new Set(["create_file", "write_file", "edit_file"]);
++const bosRefOriginals = new Map();
++const bosLiteralRetries = new Map();
++const bosQuotedRefOutputs = new Set();
++{
++	const { ToolOutputReferenceRegistry } = require("/app/node_modules/@librechat/agents/dist/cjs/tools/toolOutputReferences.cjs");
++	const replaceInString = ToolOutputReferenceRegistry.prototype.replaceInString;
++	ToolOutputReferenceRegistry.prototype.replaceInString = function(entries, input, unresolved) {
++		const output = replaceInString.call(this, entries, input, unresolved);
++		if (output !== input && output.length > BOS_CODE_LITERAL_MAX) {
++			bosRefOriginals.set(output, input);
++			if (bosRefOriginals.size > 64) bosRefOriginals.delete(bosRefOriginals.keys().next().value);
++		}
++		if (output !== input && BOS_QUOTED_REF.test(input)) {
++			bosQuotedRefOutputs.add(output);
++			if (bosQuotedRefOutputs.size > 64) bosQuotedRefOutputs.delete(bosQuotedRefOutputs.values().next().value);
++		}
++		return output;
++	};
++}
++function bosLongDataLiteral(code) {
++	if (code.length <= BOS_CODE_LITERAL_MAX) return null;
++	const open = [];
++	let longest = null;
++	for (let i = 0; i < code.length; i++) {
++		const c = code.charCodeAt(i);
++		if (c === 123 || c === 91) open.push(i);
++		else if ((c === 125 || c === 93) && open.length > 0) {
++			const start = open.pop();
++			const length = i - start + 1;
++			if (length > BOS_CODE_LITERAL_MAX && length > (longest?.length ?? 0)) {
++				const literal = code.slice(start, i + 1);
++				if ((literal.match(BOS_CODE_LITERAL_KEY)?.length ?? 0) >= BOS_CODE_LITERAL_KEYS_MIN) longest = literal;
++			}
++		}
++	}
++	return longest;
++}
++function bosCodeDataLiteral(tc, user) {
++	let args = tc.args ?? {};
++	if (typeof args === "string") try {
++		args = JSON.parse(args);
++	} catch {
++		args = { code: args };
++	}
++	const written = Object.values(args).filter((value) => typeof value === "string").map((value) => bosRefOriginals.get(value) ?? value).join("\n");
++	const literal = bosLongDataLiteral(written);
++	if (literal == null) return null;
++	const length = literal.length;
++	/** Dieselben Daten laufen beim zweiten Mal, auch wenn der Code darum herum anders ist. */
++	const retryKey = `${user ?? ""}\n${require("crypto").createHash("sha256").update(literal).digest("hex")}`;
++	if (bosLiteralRetries.delete(retryKey)) {
++		_librechat_data_schemas.logger.info(`[code-data-literal] ${tc.name}: ${length} characters, sent again, run`);
++		return null;
++	}
++	bosLiteralRetries.set(retryKey, Date.now());
++	if (bosLiteralRetries.size > 200) bosLiteralRetries.delete(bosLiteralRetries.keys().next().value);
++	_librechat_data_schemas.logger.info(`[code-data-literal] ${tc.name}: ${length} characters of data typed into the code, not run`);
++	return errorResult(tc, `This call types ${length} characters of data into code or a file; nothing was run. Do not copy tool results into code or files. Put a reference where the data is: the {{toolNturnM}} key from the [ref: ...] line or _ref field of the result, exactly as shown there (in {{tool0turn2}} the first number is the position of the call in its step, the second the step), the data reference from a [DATA] line, or the file reference from a [FILE] line. If the data is not from a tool result, for example from the user's message, send the call again with the same data.`);
++}
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {

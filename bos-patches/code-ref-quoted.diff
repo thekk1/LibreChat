@@ -1,0 +1,31 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138178,6 +138178,10 @@
+ const BOS_CODE_LITERAL_FILE_TOOLS = new Set(["create_file", "write_file", "edit_file"]);
+ const bosRefOriginals = new Map();
+ const bosLiteralRetries = new Map();
++/** BOS-Patch code-ref-quoted: Steht ein {{toolNturnM}} im Code direkt an einem Anfuehrungszeichen, setzt das SDK das
++ *  Ergebnis als rohen Text in einen String; seine Anfuehrungszeichen und Backslashes brechen ihn. Der Aufruf laeuft
++ *  dann nicht, die Meldung nennt den Heredoc. Gemerkt wird der eingesetzte Text, geprueft in bosPrepareToolArgs. */
++const BOS_QUOTED_REF = /["'][ \t]*\{\{tool\d+turn\d+\}\}|\{\{tool\d+turn\d+\}\}[ \t]*["']/;
+ const bosQuotedRefOutputs = new Set();
+ {
+ 	const { ToolOutputReferenceRegistry } = require("/app/node_modules/@librechat/agents/dist/cjs/tools/toolOutputReferences.cjs");
+@@ -138195,6 +138199,17 @@
+ 		return output;
+ 	};
+ }
++function bosQuotedRef(tc) {
++	let args = tc.args ?? {};
++	if (typeof args === "string") try {
++		args = JSON.parse(args);
++	} catch {
++		args = { code: args };
++	}
++	if (!Object.values(args).some((value) => typeof value === "string" && bosQuotedRefOutputs.has(value))) return null;
++	_librechat_data_schemas.logger.info(`[code-ref-quoted] ${tc.name}: placeholder inside quotes, not run`);
++	return errorResult(tc, `This call puts a result placeholder directly next to a quote, inside a string; nothing was run. The system inserts the raw text of the result there, and its quotes and backslashes break the string. Put the placeholder alone on its own lines in a quoted heredoc and read the file, as in: cat > /tmp/r.json <<'EOF' / placeholder / EOF, then json.load(open("/tmp/r.json")). A data reference from a [DATA] line instead becomes a file path and goes inside open("...").`);
++}
+ function bosLongDataLiteral(code) {
+ 	if (code.length <= BOS_CODE_LITERAL_MAX) return null;
+ 	const open = [];

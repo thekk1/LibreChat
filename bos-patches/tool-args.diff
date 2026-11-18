@@ -1,0 +1,115 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -137989,6 +137989,103 @@
+ 		}
+ 	};
+ }
++/** BOS-Patch tool-args: Verweise in den Argumenten jedes Werkzeugaufrufs, von Haupt- und Subagenten.
++ *  {{data:D-...}} wird aus bosToolData eingesetzt (nur derselbe Nutzer und Chat). Ein {{toolNturnM}},
++ *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
++ *  Platzhalter als Text. */
++const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
++const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
++async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
++	const bosStep = metadata?.langgraph_step;
++	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
++		_librechat_data_schemas.logger.debug(`[round-guard] subagent step ${bosStep}, ${toolCalls.length} call(s)`);
++		if (bosStep >= BOS_SUBAGENT_STEP_GUARD) {
++			_librechat_data_schemas.logger.info(`[round-guard] subagent step ${bosStep} over ${BOS_SUBAGENT_STEP_GUARD}: ${toolCalls.length} call(s) not run`);
++			for (const tc of toolCalls) blocked.set(tc, errorResult(tc, "Round limit reached: this task has used almost all of its rounds; nothing was run. Do not call any more tools. Answer now with what you have read so far, and say what is missing."));
++			return;
++		}
++	}
++	const user = resolveBackgroundUserId(configurable);
++	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
++	for (const tc of toolCalls) {
++		const text = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {});
++		const outputRefs = [...new Set([...text.matchAll(BOS_TOOL_OUTPUT_REF)].map((match) => `{{${match[1]}}}`))];
++		if (outputRefs.length > 0) {
++			blocked.set(tc, errorResult(tc, `Unknown output reference ${outputRefs.join(", ")}; nothing was run. A result can be referenced only by the key on its own [ref: toolNturnM] line or _ref field, exactly as shown there; a result without one is no longer stored. Copy the key, do not rebuild it: in {{tool0turn2}} the first number is the position of the call in its step, the second the step, so {{tool2turn0}} is a different result. Do not type the data into the code instead; fetch it again if its key is gone.`));
++			continue;
++		}
++		if (BOS_CODE_LITERAL_FILE_TOOLS.has(tc.name) || isCodeSessionAwareToolCall(tc.name, configurable ?? {})) {
++			const quoted = bosQuotedRef(tc);
++			if (quoted != null) {
++				blocked.set(tc, quoted);
++				continue;
++			}
++			const literal = bosCodeDataLiteral(tc, user);
++			if (literal != null) {
++				blocked.set(tc, literal);
++				continue;
++			}
++		}
++		*  Ueber die Sandbox kaeme sie erst nach einem Codeaufruf an, der sie dorthin hochlaedt. */
++		if (tc.name === "read_file" && text.includes("{{file:")) {
++			blocked.set(tc, await bosReadFileRef(tc, { user, conversationIds }, configurable?.req));
++			continue;
++		}
++		if (text.includes("{{file:") && tc.name !== "subagent") try {
++			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
++			/** BOS: Inhalt als base64 nur fuer MCP-Werkzeuge; eingebaute Werkzeuge wie read_file koennen damit
++			*  nichts anfangen, das Modell bekaeme die Bytes als Text. */
++			if (!isCode && !String(tc.name).includes(librechat_data_provider.Constants.mcp_delimiter)) {
++				blocked.set(tc, errorResult(tc, `{{file:...}} works only in MCP tool arguments, in code (execute_code, bash_tool: it becomes the path under /mnt/data) and in your answer (the user sees the file there); nothing was run. To show a file to the user, write its {{file:...}} in your answer.`));
++				continue;
++			}
++			if (isCode && !user) throw new Error("no user for the code upload");
++			const { args, unknown, codeFiles } = await bosToolFiles.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeUploader(configurable, user) : null);
++			if (unknown.length > 0) {
++				blocked.set(tc, errorResult(tc, `Unknown file reference ${unknown.join("; ")}; nothing was run. Use only IDs from [FILE] lines of this chat or names of files in this chat.`));
++				continue;
++			}
++			tc.args = args;
++			if (codeFiles.length > 0) {
++				/** Die eben hochgeladene Fassung ersetzt eine gleichnamige Datei der Sitzung: diese stammt vom Beginn
++				*  des Laufs, und mergeCodeFilesIntoContext behielte sonst sie und verwuerfe die neue. */
++				const names = new Set(codeFiles.map((file) => file.name));
++				const prior = tc.codeSessionContext == null ? void 0 : {
++					...tc.codeSessionContext,
++					files: (tc.codeSessionContext.files ?? []).filter((file) => !names.has(file.name))
++				};
++				const merged = mergeCodeFilesIntoContext(prior, codeFiles);
++				if (merged) tc.codeSessionContext = merged;
++			}
++		} catch (error) {
++			_librechat_data_schemas.logger.error("[bosToolFiles] tool arguments", error);
++			blocked.set(tc, errorResult(tc, `File references could not be resolved (${error.message}); nothing was run.`));
++			continue;
++		}
++		if (!JSON.stringify(tc.args ?? {}).includes("{{data:")) continue;
++		try {
++			const isCode = isCodeSessionAwareToolCall(tc.name, configurable ?? {});
++			if (isCode && !user) throw new Error("no user for the code upload");
++			const { args, unknown, codeFiles } = await bosToolData.expandArgs(tc.args, { user, conversationIds }, isCode ? bosCodeDataUploader(configurable, user) : null);
++			if (unknown.length > 0) blocked.set(tc, errorResult(tc, `Unknown data reference ${unknown.join("; ")}; nothing was run. Use only references from [DATA] lines of this chat, or have the data fetched again.`));
++			else {
++				tc.args = args;
++				if (codeFiles.length > 0) {
++					const names = new Set(codeFiles.map((file) => file.name));
++					const prior = tc.codeSessionContext == null ? void 0 : {
++						...tc.codeSessionContext,
++						files: (tc.codeSessionContext.files ?? []).filter((file) => !names.has(file.name))
++					};
++					const merged = mergeCodeFilesIntoContext(prior, codeFiles);
++					if (merged) tc.codeSessionContext = merged;
++				}
++			}
++		} catch (error) {
++			_librechat_data_schemas.logger.error("[bosToolData] tool arguments", error);
++			blocked.set(tc, errorResult(tc, "Data references could not be resolved; nothing was run. Try again later."));
++		}
++	}
++}
+ function getToolFailureFeedback(content) {
+ 	if (typeof content === "string") return content;
+ 	const messages = [];
+@@ -138063,6 +138160,8 @@
+ 						if (filteredName != null) preloadedNameBlocks.set(tc, filteredName);
+ 						else allowedToolCalls.push(tc);
+ 					}
++					await bosPrepareToolArgs(allowedToolCalls, preloadedNameBlocks, sourceConfigurable, metadata);
++					for (let index = allowedToolCalls.length - 1; index >= 0; index--) if (preloadedNameBlocks.has(allowedToolCalls[index])) allowedToolCalls.splice(index, 1);
+ 					if (allowedToolCalls.length === 0) {
+ 						resolve(toolCalls.map((tc) => reportResult(preloadedNameBlocks.get(tc) ?? errorResult(tc, "Submitted tool name was blocked."))));
+ 						return;

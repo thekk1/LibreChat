@@ -1,0 +1,87 @@
+--- a/packages/api/dist/client-CgATq3JF.cjs
++++ b/packages/api/dist/client-CgATq3JF.cjs
+@@ -84,8 +84,8 @@
+ 	"when you are genuinely blocked on decisions you cannot resolve from the conversation or your",
+ 	"other tools. Put every related question in this ONE tool call, and NEVER call this tool in",
+ 	"parallel with any other tool call. Use stable, concise ids matching",
+-	"[A-Za-z][A-Za-z0-9_-]{0,63}. When the realistic",
+-	"answers are enumerable, provide 2-6 concise options; set multiSelect to true only when",
++	"[A-Za-z][A-Za-z0-9_-]{0,63}. Always provide 2-6",
++	"concise options with the likely answers, also for open questions; set multiSelect to true only when",
+ 	"several options may sensibly apply at once (the selected option values are returned joined",
+ 	`by ", "). Keep every option label within ${OPTION_LABEL_MAX} characters and put supporting`,
+ 	"context in the question description. The user can always type a free-form answer instead — so",
+@@ -106,7 +106,7 @@
+ 	options: zod.z.array(zod.z.object({
+ 		label: zod.z.string().min(1).max(OPTION_LABEL_MAX, OPTION_LABEL_MAX_ERROR).describe(OPTION_LABEL_DESCRIPTION),
+ 		value: zod.z.string().min(1).max(OPTION_VALUE_MAX).describe("Value returned as the answer if this option is picked.")
+-	})).max(OPTIONS_MAX).optional().describe("Optional pre-defined choices (2-6 recommended). Omit to require a free-form answer."),
++	})).min(2).max(OPTIONS_MAX).describe("Required: 2-6 pre-defined choices with the likely answers. The user can still type a free-form answer."),
+ 	multiSelect: zod.z.boolean().optional().describe("Allow the user to pick several options; their values are returned joined by \", \".")
+ });
+ const askUserQuestionsArraySchema = zod.z.array(askUserQuestionItemSchema).min(1).max(_librechat_agents.MAX_ASK_USER_QUESTIONS).refine((questions) => new Set(questions.map((question) => question.id)).size === questions.length, { message: "Question ids must be unique." }).describe("One to four related questions presented to the user in one interaction.");
+@@ -157,8 +157,9 @@
+ 					},
+ 					options: {
+ 						type: "array",
++						minItems: 2,
+ 						maxItems: OPTIONS_MAX,
+-						description: "Optional pre-defined choices. Omit for free-form only.",
++						description: "Required: 2-6 pre-defined choices with the likely answers. The user can still type a free-form answer.",
+ 						items: {
+ 							type: "object",
+ 							properties: {
+@@ -183,7 +184,11 @@
+ 						description: "Allow several option values for this question."
+ 					}
+ 				},
+-				required: ["id", "question"]
++				required: [
++					"id",
++					"question",
++					"options"
++				]
+ 			}
+ 		} },
+ 		required: ["questions"]
+@@ -234,6 +239,40 @@
+ 	askTool.invoke = (async (input, config) => {
+ 		try {
+ 			const candidate = typeof input === "object" && input != null && "args" in input ? input.args : input;
++			/** BOS-Patch: Qwen ueber radiance liefert verschachtelte Listen als JSON-Text
++			*  ("questions": "[{...}]"); vor der Schemapruefung in Listen umwandeln. */
++			const parseJsonList = (value) => {
++				if (typeof value !== "string") return value;
++				try {
++					const parsed = JSON.parse(value);
++					return Array.isArray(parsed) ? parsed : value;
++				} catch {
++					/** Deutsches Anfuehrungszeichen „…" mit geradem Schlusszeichen beendet den JSON-Text vorzeitig;
++					*  ist das Schlusszeichen maskiert („…\"), faellt der Backslash mit weg. */
++					try {
++						const parsed = JSON.parse(value.replace(/„([^"“”\n\\]*)\\?"/g, "„$1“"));
++						return Array.isArray(parsed) ? parsed : value;
++					} catch {
++						return value;
++					}
++				}
++			};
++			if (candidate != null && typeof candidate === "object") {
++				if ("questions" in candidate) candidate.questions = parseJsonList(candidate.questions);
++				if (Array.isArray(candidate.questions)) for (const question of candidate.questions) {
++					if (question == null || typeof question !== "object") continue;
++					if ("options" in question) question.options = parseJsonList(question.options);
++					/** Fehlt der Fragetext, steht er meist in description oder header */
++					if (typeof question.question !== "string" || question.question.trim() === "") {
++						if (typeof question.description === "string" && question.description.trim() !== "") {
++							question.question = question.description.slice(0, QUESTION_MAX);
++							delete question.description;
++						} else if (typeof question.header === "string" && question.header.trim() !== "") question.question = question.header;
++					}
++					if (typeof question.header === "string" && question.header.length > HEADER_MAX) question.header = question.header.slice(0, HEADER_MAX);
++				}
++				if ("options" in candidate) candidate.options = parseJsonList(candidate.options);
++			}
+ 			if (legacyAskUserQuestionToolSchema.safeParse(candidate).success) return await legacyAskTool.invoke(input, config);
+ 			return await invoke(input, config);
+ 		} catch (error) {
