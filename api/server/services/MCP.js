@@ -81,7 +81,8 @@ const { getLogStores } = require('~/cache');
 /**
  * BOS-Patch tool-budget: begrenzt die Aufrufe der Werkzeuge eines MCP-Servers. BOS_TOOL_BUDGET nennt je
  * Server die Grenze je Subagenten-Lauf und optional die Grenze je Benutzernachricht ueber alle Laeufe
- * ("browse:5:10", mehrere durch Komma). Danach liefert jedes Werkzeug des Servers nur noch die
+ * ("browse:5:10", mehrere durch Komma). Ein viertes Feld nennt Werkzeuge des Servers, die nicht zaehlen
+ * ("nextcloud:15:30:nc_office_copy_file_to_chat", mehrere durch "+"). Danach liefert jedes Werkzeug des Servers nur noch die
  * Aufforderung, mit dem Gelesenen zu antworten; so endet der Lauf, statt am recursion_limit abzubrechen
  * und alles Gelesene zu verlieren. Der Lauf ist die subagentRunId aus dem executionContext des
  * Subagenten, sonst die run_id; die Nachricht ist die rootRunId, sonst ebenfalls die run_id. Zur Grenze
@@ -92,9 +93,13 @@ const bosToolBudgets = new Map(
     .split(',')
     .map((entry) => entry.trim().split(':'))
     .filter(([server, limit]) => server && Number(limit) > 0)
-    .map(([server, limit, total]) => [
+    .map(([server, limit, total, free]) => [
       server,
-      { limit: Number(limit), total: Number(total) > 0 ? Number(total) : 0 },
+      {
+        limit: Number(limit),
+        total: Number(total) > 0 ? Number(total) : 0,
+        free: new Set((free || '').split('+').filter(Boolean)),
+      },
     ]),
 );
 const bosToolBudgetCounts = new Map();
@@ -105,9 +110,9 @@ function bosToolBudgetCount(key, now) {
   bosToolBudgetCounts.set(key, entry);
   return entry.count;
 }
-function bosToolBudgetExceeded(serverName, config) {
+function bosToolBudgetExceeded(serverName, config, toolName) {
   const budget = bosToolBudgets.get(serverName);
-  if (!budget) {
+  if (!budget || budget.free.has(toolName)) {
     return null;
   }
   const executionContext = config?.configurable?.executionContext;
@@ -1332,7 +1337,7 @@ function createToolInstance({
 
   /** @type {(toolArguments: Object | string, config?: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolArguments, config) => {
-    const bosBudgetNote = bosToolBudgetExceeded(serverName, config);
+    const bosBudgetNote = bosToolBudgetExceeded(serverName, config, toolName);
     if (bosBudgetNote) {
       return [bosBudgetNote, null];
     }
