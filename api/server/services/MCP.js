@@ -154,6 +154,66 @@ function bosToolBudgetExceeded(serverName, config, toolName) {
   }
   return null;
 }
+
+/**
+ * BOS-Patch mcp-secret-mask: ersetzt in den Ergebnissen aller MCP-Werkzeuge Werte, die nach
+ * Passwort, Secret, Token oder Schluessel aussehen, durch BOS_SECRET_MARK: Optionen
+ * (-Dimap_pass=..., -Dserver_secret=...), JSON-Felder ("password": "..."), Umgebungsvariablen
+ * (DB_PASSWORD=...) und Werte "unencrypted:...". Ein Aufruf, dessen Argumente die Marke enthalten,
+ * wird abgewiesen: Ein Subagent schriebe sonst eine gelesene Konfiguration mit der Marke statt des
+ * echten Werts zurueck.
+ */
+const BOS_SECRET_MARK = '***masked***';
+const BOS_SECRET_WORDS = 'pass(?:wd|word)?|pwd|secret|token|credential|api_?key|private_?key';
+const BOS_SECRET_PATTERNS = [
+  [new RegExp(`(-D[\\w.\\-]*?(?:${BOS_SECRET_WORDS})[\\w.\\-]*=)(?:"[^"]*"|[^\\s"\\\\,;<]+)`, 'gi'), `$1${BOS_SECRET_MARK}`],
+  [
+    /("[\w.\-]*(?:password|passwd|pwd|secret|api_?key|private_?key|access_?token|refresh_?token|auth_?token)[\w.\-]*"\s*:\s*")((?:[^"\\]|\\.)*)"/gi,
+    `$1${BOS_SECRET_MARK}"`,
+  ],
+  [
+    /(\\"[\w.\-]*(?:password|passwd|pwd|secret|api_?key|private_?key|access_?token|refresh_?token|auth_?token)[\w.\-]*\\"\s*:\s*\\")((?:[^"\\]|\\[^"])*)\\"/gi,
+    `$1${BOS_SECRET_MARK}\\"`,
+  ],
+  [/\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY)[A-Z0-9_]*=)[^\s"\\,;<]+/g, `$1${BOS_SECRET_MARK}`],
+  [/(unencrypted:)[^\s"\\,;<]+/g, `$1${BOS_SECRET_MARK}`],
+];
+function bosMaskString(text) {
+  let out = text;
+  for (const [re, rep] of BOS_SECRET_PATTERNS) {
+    out = out.replace(re, (...m) => {
+      const value = m[0].slice(m[1].length).replace(/\\?"$/, '');
+      if (value === BOS_SECRET_MARK || value === '' || /^\$\{[^}]*\}$|^%[^%]*%$/.test(value ?? '')) {
+        return m[0];
+      }
+      return rep.replace(/\$1/g, m[1]);
+    });
+  }
+  return out;
+}
+function bosMaskSecrets(value, depth = 0) {
+  if (typeof value === 'string') {
+    return bosMaskString(value);
+  }
+  if (depth > 6 || value == null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => bosMaskSecrets(v, depth + 1));
+  }
+  if (typeof value === 'object' && typeof value.text === 'string') {
+    return { ...value, text: bosMaskString(value.text) };
+  }
+  return value;
+}
+function bosArgumentsMasked(toolArguments) {
+  try {
+    const raw = typeof toolArguments === 'string' ? toolArguments : JSON.stringify(toolArguments);
+    return typeof raw === 'string' && raw.includes(BOS_SECRET_MARK);
+  } catch {
+    return false;
+  }
+}
 const {
   clearMCPAuthorizationFenceRetry,
   persistMCPAuthorizationFenceRetry,
@@ -1341,6 +1401,15 @@ function createToolInstance({
     if (bosBudgetNote) {
       return [bosBudgetNote, null];
     }
+    if (bosArgumentsMasked(toolArguments)) {
+      logger.info(`[secret-mask] ${serverName}: refused ${toolName}, arguments contain the mask`);
+      return [
+        `Refused: the input contains ${BOS_SECRET_MARK}, a secret value the system hid when it was read. ` +
+          'It cannot be written back. Change only parts without hidden values, or tell the user to make ' +
+          'the change in the system itself.',
+        null,
+      ];
+    }
     const effectiveUser = config?.configurable?.user ?? capturedUser;
     const permissionUser = effectiveUser;
     /** @type {string | undefined} */
@@ -1444,10 +1513,12 @@ function createToolInstance({
         oboIdentityContext: capturedOboIdentityContext,
       });
 
-      if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
-        return result[0];
+      const bosResult =
+        Array.isArray(result) ? [bosMaskSecrets(result[0]), ...result.slice(1)] : bosMaskSecrets(result);
+      if (isAssistantsEndpoint(provider) && Array.isArray(bosResult)) {
+        return bosResult[0];
       }
-      return result;
+      return bosResult;
     } catch (error) {
       /** A user Stop aborts every in-flight call at once, and that rejection is
        *  the cancellation working, so it must not reach error-level operational
