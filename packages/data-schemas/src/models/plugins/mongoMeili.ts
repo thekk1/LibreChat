@@ -760,7 +760,27 @@ const createMeiliMongooseModel = ({
       params: SearchParams,
       populate: boolean,
     ): Promise<SearchResponse<MeiliIndexable, Record<string, unknown>>> {
-      const data = await index.search(q, params);
+      // Meilisearch splits "10.49.8.1" into the words 10, 49, 8 and 1 and, with its default strategy,
+      // drops words until something matches; almost every chat was a hit. A term with a separator
+      // inside becomes a phrase, and every term has to match. Only the visible text is searched:
+      // the chat title, the user's message and the answer text, not thoughts, tool calls, tool
+      // results or subagents.
+      const query =
+        typeof q === 'string'
+          ? q.replace(/"[^"]*"|\S+/g, (term) => {
+              if (term.startsWith('"')) {
+                return term;
+              }
+              const core = term.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+              return /[^\p{L}\p{N}]/u.test(core) ? `"${core.replace(/"/g, '')}"` : term;
+            })
+          : q;
+      const attributesToSearchOn = primaryKey === 'messageId' ? ['text', 'content.text'] : ['title'];
+      const data = await index.search(query, {
+        matchingStrategy: 'all',
+        attributesToSearchOn,
+        ...params,
+      });
 
       if (populate) {
         const query: Record<string, unknown> = {};
