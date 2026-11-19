@@ -3876,7 +3876,7 @@ export function createConversationMethods(
         const searchParams: SearchParams = {
           filter: `user = "${escapeMeiliFilterValue(user)}"`,
           limit: MEILI_SEARCH_LIMIT,
-          attributesToRetrieve: ['conversationId', 'originalConversationId'],
+          attributesToRetrieve: ['conversationId', 'originalConversationId', 'messageId'],
         };
         const [convoResults, messageHits] = await Promise.all([
           Conversation.meiliSearch(search, searchParams),
@@ -3899,8 +3899,53 @@ export function createConversationMethods(
             matchingIds.add(hit.conversationId);
           }
         }
+        // Only count messages of the version a chat shows when it opens: at every fork the client
+        // shows the newest message (siblingIdx 0). A hit in a replaced version found the chat
+        // although the term was nowhere to be seen in it.
+        const visibleMessageIds = new Set<string>();
+        const hitConversationIds = [
+          ...new Set(
+            messageHits
+              .map((hit) => hit.conversationId)
+              .filter((id): id is string => typeof id === 'string'),
+          ),
+        ];
+        if (hitConversationIds.length > 0) {
+          type BranchRow = Pick<IMessage, 'messageId' | 'parentMessageId' | 'conversationId'>;
+          const rows = (await (mongoose.models.Message as Model<IMessage>)
+            .find(
+              { user, conversationId: { $in: hitConversationIds } },
+              { _id: 0, messageId: 1, parentMessageId: 1, conversationId: 1, createdAt: 1 },
+            )
+            .sort({ createdAt: 1 })
+            .lean()) as BranchRow[];
+          const rowsByConversation = new Map<string, BranchRow[]>();
+          for (const row of rows) {
+            const list = rowsByConversation.get(row.conversationId) ?? [];
+            list.push(row);
+            rowsByConversation.set(row.conversationId, list);
+          }
+          for (const list of rowsByConversation.values()) {
+            const ids = new Set(list.map((row) => row.messageId));
+            const children = new Map<string | null, BranchRow[]>();
+            for (const row of list) {
+              const parent =
+                row.parentMessageId && ids.has(row.parentMessageId) ? row.parentMessageId : null;
+              children.set(parent, [...(children.get(parent) ?? []), row]);
+            }
+            for (let level = children.get(null); level?.length; ) {
+              const shown = level[level.length - 1];
+              visibleMessageIds.add(shown.messageId);
+              level = children.get(shown.messageId);
+            }
+          }
+        }
         for (const hit of messageHits) {
-          if (typeof hit.conversationId === 'string') {
+          if (
+            typeof hit.conversationId === 'string' &&
+            typeof hit.messageId === 'string' &&
+            visibleMessageIds.has(hit.messageId)
+          ) {
             matchingIds.add(hit.conversationId);
           }
         }

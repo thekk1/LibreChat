@@ -1105,8 +1105,11 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
     }
 
     try {
+      // Only the fields meiliSearch searches on are searchable. With every field searchable,
+      // Meilisearch also indexed tool results and subagents.
       await index.updateSettings({
         filterableAttributes: ['user'],
+        searchableAttributes: indexName === 'messages' ? ['text', 'content.text'] : ['title'],
       });
       logger.debug(`[mongoMeili] Updated index ${indexName} settings to make 'user' filterable`);
     } catch (settingsError) {
