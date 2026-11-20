@@ -524,7 +524,19 @@ function shownColumns(set) {
 	const keep = set.columns.filter((name) => {
 		const values = set.rows.map((row) => row[name]);
 		// Listen von Texten (Pfade) bleiben, sie werden kommagetrennt; Objekte und Listen von Objekten nicht.
-		const nested = (value) => value !== null && typeof value === "object" && (!Array.isArray(value) || value.some((item) => item !== null && typeof item === "object"));
+		// Die Zeilen speichern verschachtelte Werte als JSON-Text ("[{\"sha\":…}]"), nicht als Objekt.
+		const parsed = (value) => {
+			if (typeof value !== "string" || !/^\s*[[{]/.test(value)) return value;
+			try {
+				return JSON.parse(value);
+			} catch {
+				return value;
+			}
+		};
+		const nested = (raw) => {
+			const value = parsed(raw);
+			return value !== null && typeof value === "object" && (!Array.isArray(value) || value.some((item) => item !== null && typeof item === "object"));
+		};
 		if (values.some(nested)) return false;
 		const urls = values.map((value, index) => [cellText(value), index]).filter(([text]) => text !== "");
 		return urls.length === 0 || !urls.every(([text, index]) => /^https?:\/\//.test(text) && links[index].has(text));
