@@ -120,9 +120,9 @@
  				const toolResult = result;
  				const admittedMCPApps = mcpApps ?? librechat_data_provider.DEFAULT_MCP_APPS_POLICY;
  				const appCompatible = !rawConfig || !rawConfig.obo && !(!isDbSourced && mcpOptionsContainGraphTokenPlaceholder(rawConfig)) && getMissingRuntimeBodyPlaceholderFields(rawConfig).length === 0;
-@@ -137994,6 +138002,32 @@
-  *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
-  *  Platzhalter als Text. */
+@@ -137992,6 +138000,32 @@
+ /** BOS-Patch tool-args: Verweise in den Argumenten jedes Werkzeugaufrufs, von Haupt- und Subagenten.
+  *  {{data:D-...}} wird aus bosToolData eingesetzt (nur derselbe Nutzer und Chat). */
  const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
 +/** BOS-Patch tool-files: {{file:F-...}} oder {{file:<Dateiname>}} wird zu base64 der Datei, in der
 + *  Codeausfuehrung zum Pfad unter /mnt/data (Datei wird vorher in die Sandbox hochgeladen). */
@@ -150,6 +150,6 @@
 +		};
 +	};
 +}
- const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
  async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
  	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {

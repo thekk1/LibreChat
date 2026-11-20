@@ -1,6 +1,6 @@
 --- a/packages/api/dist/index.cjs
 +++ b/packages/api/dist/index.cjs
-@@ -138098,6 +138098,21 @@
+@@ -138096,6 +138096,21 @@
  		};
  	};
  }
@@ -19,10 +19,10 @@
 +		}
 +	};
 +}
- const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
  /** BOS-Patch subagent-round-guard: Ab diesem Schritt des Graphen (metadata.langgraph_step) fuehrt ein Subagent
  *  kein Werkzeug mehr aus und bekommt die Aufforderung zu antworten. So endet der Lauf vor dem recursion_limit
-@@ -138290,6 +138305,7 @@
+ *  regulaer, statt mit "Recursion limit reached" abzubrechen und alles Gelesene zu verlieren. 0 = aus. */
+@@ -138282,6 +138297,7 @@
  		}
  		if (!JSON.stringify(tc.args ?? {}).includes("{{data:")) continue;
  		try {

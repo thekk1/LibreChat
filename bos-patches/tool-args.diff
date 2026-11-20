@@ -1,15 +1,12 @@
 --- a/packages/api/dist/index.cjs
 +++ b/packages/api/dist/index.cjs
-@@ -137989,6 +137989,103 @@
+@@ -137989,6 +137989,95 @@
  		}
  	};
  }
 +/** BOS-Patch tool-args: Verweise in den Argumenten jedes Werkzeugaufrufs, von Haupt- und Subagenten.
-+ *  {{data:D-...}} wird aus bosToolData eingesetzt (nur derselbe Nutzer und Chat). Ein {{toolNturnM}},
-+ *  das hier noch steht, hat das SDK nicht aufgeloest; ohne diese Pruefung liefe der Befehl mit dem
-+ *  Platzhalter als Text. */
++ *  {{data:D-...}} wird aus bosToolData eingesetzt (nur derselbe Nutzer und Chat). */
 +const bosToolData = require("/app/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolData.cjs");
-+const BOS_TOOL_OUTPUT_REF = /\{\{(tool\d+turn\d+)\}\}/g;
 +async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
 +	const bosStep = metadata?.langgraph_step;
 +	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
@@ -24,11 +21,6 @@
 +	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
 +	for (const tc of toolCalls) {
 +		const text = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {});
-+		const outputRefs = [...new Set([...text.matchAll(BOS_TOOL_OUTPUT_REF)].map((match) => `{{${match[1]}}}`))];
-+		if (outputRefs.length > 0) {
-+			blocked.set(tc, errorResult(tc, `Unknown output reference ${outputRefs.join(", ")}; nothing was run. A result can be referenced only by the key on its own [ref: toolNturnM] line or _ref field, exactly as shown there; a result without one is no longer stored. Copy the key, do not rebuild it: in {{tool0turn2}} the first number is the position of the call in its step, the second the step, so {{tool2turn0}} is a different result. Do not type the data into the code instead; fetch it again if its key is gone.`));
-+			continue;
-+		}
 +		if (BOS_CODE_LITERAL_FILE_TOOLS.has(tc.name) || isCodeSessionAwareToolCall(tc.name, configurable ?? {})) {
 +			const quoted = bosQuotedRef(tc);
 +			if (quoted != null) {
@@ -104,7 +96,7 @@
  function getToolFailureFeedback(content) {
  	if (typeof content === "string") return content;
  	const messages = [];
-@@ -138063,6 +138160,8 @@
+@@ -138063,6 +138152,8 @@
  						if (filteredName != null) preloadedNameBlocks.set(tc, filteredName);
  						else allowedToolCalls.push(tc);
  					}
