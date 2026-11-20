@@ -500,7 +500,8 @@ function linkOf(set, name, row) {
 	if (server === "jira-mercedes" && name === "key") {
 		return /^[A-Z][A-Z0-9_]*-\d+$/.test(value) ? `https://mercedes-benz.atlassian.net/browse/${value}` : null;
 	}
-	if (server === "gitea" && ["number", "full_name", "name"].includes(name)) return row.html_url || null;
+	// subject: Betreffzeilen eines Pushes aus list_user_activities, html_url zeigt auf Commit oder Vergleich.
+	if (server === "gitea" && ["number", "full_name", "name", "subject"].includes(name)) return row.html_url || null;
 	if (server === "nextcloud" && ["name", "path"].includes(name)) return row.url || null;
 	if (server === "jenkins" && ["name", "fullname", "displayName", "number"].includes(name)) {
 		// Jenkins nennt seine Stammadresse http://jenkins:8090/, die nur mit passendem Suchsuffix aufloest.
