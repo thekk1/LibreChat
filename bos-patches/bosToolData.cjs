@@ -516,8 +516,23 @@ function linked(set, name, row, text) {
 	if (!url || !/^https?:\/\/[^\s()]+$/.test(url)) return text;
 	return `[${text.replace(/[[\]]/g, "\\$&")}](${url})`;
 }
+/** Spalten fuer einen Verweis ohne Spaltenauswahl: ohne verschachtelte Werte (Listen, Objekte) und ohne
+ *  URL-Spalten, deren Adresse schon als Link einer anderen Spalte derselben Zeile erscheint. Plan setzte
+ *  die Gitea-Aktivitaeten mit rohem JSON in commits und html_url als nackter URL ein. */
+function shownColumns(set) {
+	const links = set.rows.map((row) => new Set(set.columns.map((name) => cellText(row[name]) === "" ? null : linkOf(set, name, row)).filter(Boolean)));
+	const keep = set.columns.filter((name) => {
+		const values = set.rows.map((row) => row[name]);
+		// Listen von Texten (Pfade) bleiben, sie werden kommagetrennt; Objekte und Listen von Objekten nicht.
+		const nested = (value) => value !== null && typeof value === "object" && (!Array.isArray(value) || value.some((item) => item !== null && typeof item === "object"));
+		if (values.some(nested)) return false;
+		const urls = values.map((value, index) => [cellText(value), index]).filter(([text]) => text !== "");
+		return urls.length === 0 || !urls.every(([text, index]) => /^https?:\/\//.test(text) && links[index].has(text));
+	});
+	return keep.length > 0 ? keep : set.columns;
+}
 function formatRows(set, wanted) {
-	const columns = wanted.length > 0 ? wanted : set.columns;
+	const columns = wanted.length > 0 ? wanted : shownColumns(set);
 	if (columns.length === 1) return set.rows.map((row) => linked(set, columns[0], row, cellText(row[columns[0]]))).join(", ");
 	// Langtext (Auszuege, Beschreibungen) macht die Tabelle im Chat unlesbar breit; Code bekommt ihn ganz.
 	const shown = (text) => text.length > MAX_SHOWN_CELL ? `${text.slice(0, MAX_SHOWN_CELL).trimEnd()} …` : text;
@@ -765,4 +780,4 @@ function createAnswerFilter({ renderFiles } = {}) {
 		}
 	};
 }
-module.exports = { formatRows, cellText, mergePages, dataPathRefs, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, nameColumns, rankForStrip, handleLine, messageText };
+module.exports = { formatRows, shownColumns, cellText, mergePages, dataPathRefs, collect, expand, expandArgs, describeRefs, createAnswerFilter, extract, stripTyped, nameColumns, rankForStrip, handleLine, messageText };
