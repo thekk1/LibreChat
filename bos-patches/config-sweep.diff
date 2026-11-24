@@ -1,0 +1,20 @@
+--- a/packages/api/dist/index.cjs	2026-11-24 14:34:32.468002567 +0100
++++ b/packages/api/dist/index.cjs	2026-11-24 14:34:32.470002535 +0100
+@@ -40994,7 +40994,7 @@
+ 		const [base] = await Promise.all([deps.getAppConfig({
+ 			baseOnly: true,
+ 			failClosed: true,
+-			refresh: true
++			refresh: options.sweep !== true
+ 		}), deps.principalAuthReady()]);
+ 		const config = readSetupConfig(base, !options.existing);
+ 		const maxOwned = resolveCodeWorkerEnrollmentLimit(sessions$1(base)?.principalWorkers);
+@@ -41822,7 +41822,7 @@
+ 			const current = getRuntime();
+ 			let interval = 1e4;
+ 			try {
+-				interval = (await current.policy.deployment()).config.reconcileIntervalMs;
++				interval = (await current.policy.deployment({ sweep: true })).config.reconcileIntervalMs;
+ 			} catch {}
+ 			nextSweep = Date.now() + interval;
+ 			await current.service.reconcile();
