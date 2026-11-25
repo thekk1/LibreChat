@@ -713,6 +713,8 @@ async function describeRefs(text, scope) {
 	if (others.length > 0) blocks.push(`Other data sets of this chat, newest first. If the request refers to items it does not list (for example "these keys" or "the tickets above") and exactly one set matches it (source and number of rows), take them from that set: write {{data:ID:column}} unchanged in tool arguments or code, never type its rows. If none or several match, do not guess: say which items are missing.\n${others.map(handleLine).join("\n")}`);
 	return { text: blocks.length === 0 ? text : `${text}\n\n${blocks.join("\n\n")}`, unknown };
 }
+/** Verweis mit nur einer schliessenden Klammer, {{file:X} statt {{file:X}}. */
+const LOOSE_REF = /\{\{(data|file):([^{}\n]+?)\}(?!\})/g;
 /** Angefangener Verweis {{data:...}} oder {{file:...}} am Ende eines Textstuecks. */
 const PARTIAL_REF = /\{(?:\{(?:(?:d(?:a(?:t(?:a)?)?)?|f(?:i(?:l(?:e)?)?)?)(?::[^{}\n]{0,200}\}?)?)?)?$/;
 const ARTIFACT_ROWS = 100;
@@ -744,7 +746,8 @@ function createAnswerFilter({ renderFiles } = {}) {
 	};
 	/** Schreibt das Modell selbst einen Tabellenkopf vor den Verweis, gilt seiner statt des eingesetzten. */
 	const mergeHeaders = (text) => text.replace(MODEL_HEADER_ARTIFACT, "\n$2$1").replace(MODEL_HEADER_TABLE, "$1");
-	const render = async (id, text, metadata, graph) => {
+	const render = async (id, raw, metadata, graph) => {
+		const text = raw.replace(LOOSE_REF, "{{$1:$2}}");
 		const result = await expand(text, {
 			user: graph?.config?.configurable?.user_id,
 			conversationId: metadata?.thread_id,

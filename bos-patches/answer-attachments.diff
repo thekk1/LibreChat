@@ -1,0 +1,39 @@
+--- a/api/app/clients/BaseClient.js
++++ b/api/app/clients/BaseClient.js
+@@ -65,6 +65,25 @@
+ const { logViolation } = require('~/cache');
+ const db = require('~/models');
+ 
++/** BOS-Patch answer-attachments: Jeder Codelauf, der eine Datei neu schreibt, und jedes Bild, das read_file
++ *  liest, wird ein Anhang der Antwort. Von Dateien gleichen Namens bleibt nur die letzte Fassung; Bilder aus
++ *  read_file (Name <Datei-ID>-read_file_img_<ID>) entfallen, die gelesene Datei liegt schon im Chat. Die
++ *  Eintraege in files bleiben, {{file:<Name>}} findet weiter die neueste. */
++const bosShownAttachments = (attachments) => {
++  const lastByName = new Map();
++  attachments.forEach((attachment, index) => {
++    if (typeof attachment.filename === 'string') {
++      lastByName.set(attachment.filename, index);
++    }
++  });
++  return attachments.filter((attachment, index) => {
++    if (typeof attachment.filename !== 'string') {
++      return true;
++    }
++    return !attachment.filename.includes('read_file_img_') && lastByName.get(attachment.filename) === index;
++  });
++};
++
+ const omitUnreplayedHistoricalFiles = (messages) =>
+   messages.map(({ files: _files, attachments: _attachments, ...message }) => ({
+     ...message,
+@@ -1214,7 +1233,9 @@
+     }
+ 
+     if (this.artifactPromises) {
+-      responseMessage.attachments = (await Promise.all(this.artifactPromises)).filter((a) => a);
++      responseMessage.attachments = bosShownAttachments(
++        (await Promise.all(this.artifactPromises)).filter((a) => a),
++      );
+     }
+ 
+     if (this.options.attachments) {
