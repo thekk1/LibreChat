@@ -1,0 +1,24 @@
+--- a/packages/api/dist/index.cjs
++++ b/packages/api/dist/index.cjs
+@@ -138254,6 +138254,7 @@
+ 	_librechat_data_schemas.logger.info(`[code-data-literal] ${tc.name}: ${length} characters of data typed into the code, not run`);
+ 	return errorResult(tc, `This call types ${length} characters of data into code or a file; nothing was run. Do not copy tool results into code or files. Put a reference where the data is: the {{toolNturnM}} key from the [ref: ...] line or _ref field of the result, exactly as shown there (in {{tool0turn2}} the first number is the position of the call in its step, the second the step), the data reference from a [DATA] line, or the file reference from a [FILE] line. If the data is not from a tool result, for example from the user's message, send the call again with the same data.`);
+ }
++const BOS_SUBAGENT_IMAGE = /\.(png|jpe?g|gif|webp|bmp|tiff?)\b/i;
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
+@@ -138268,6 +138269,13 @@
+ 	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
+ 	for (const tc of toolCalls) {
+ 		const text = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {});
++		/** BOS-Patch subagent-no-images: Ein Subagent sieht keine Bilder an (gerenderte Seiten, Ausschnitte). Er gibt die
++		 *  Datei als [FILE]-Zeile zurueck und nennt die Seiten; der Hauptagent sieht sie an. */
++		if ((metadata?.executionContext?.depth ?? 0) > 0 && tc.name === "read_file" && BOS_SUBAGENT_IMAGE.test(text)) {
++			_librechat_data_schemas.logger.info("[subagent-no-images] read_file of an image in a subagent, not run");
++			blocked.set(tc, errorResult(tc, "A subagent does not look at images or rendered pages; nothing was read. Return the file the image comes from as its [FILE] line and name the pages to look at; the main agent looks at them."));
++			continue;
++		}
+ 		if (BOS_CODE_LITERAL_FILE_TOOLS.has(tc.name) || isCodeSessionAwareToolCall(tc.name, configurable ?? {})) {
+ 			const quoted = bosQuotedRef(tc);
+ 			if (quoted != null) {

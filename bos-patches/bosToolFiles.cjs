@@ -149,10 +149,21 @@ function asText(bytes) {
 		return null;
 	}
 }
+/** base64 ohne regulaeren Ausdruck ueber den ganzen Text: ein Ausdruck mit Wiederholung lief bei 8 MB in RangeError. */
+function isBase64(text) {
+	let end = text.length;
+	while (end > 0 && text.charCodeAt(end - 1) === 61) end--;
+	if (end === 0 || text.length - end > 2) return false;
+	for (let i = 0; i < end; i++) {
+		const c = text.charCodeAt(i);
+		if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 47 || c === 95 || c === 45)) return false;
+	}
+	return true;
+}
 function decodeBase64(text) {
 	if (typeof text !== "string" || text.length === 0) return null;
 	const clean = text.replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
-	if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(clean)) return null;
+	if (!isBase64(clean)) return null;
 	const bytes = Buffer.from(clean, "base64");
 	return bytes.length > 0 ? bytes : null;
 }
@@ -345,7 +356,9 @@ async function resolveExact(key, { user, conversationIds }) {
 	if (byName.length > 0) return byName[0];
 	const File = fileModel();
 	if (!File) return null;
-	const file = await File.findOne({ user: String(user), conversationId: { $in: ids }, filename: key, source: "local" }).sort({ createdAt: -1 }).lean();
+	/** Neueste Fassung: Ergebnisse der Codeausfuehrung haben kein createdAt, jeder Lauf legt einen eigenen Eintrag
+	 *  mit demselben Namen an; updatedAt ist der Zeitpunkt des Laufs. */
+	const file = await File.findOne({ user: String(user), conversationId: { $in: ids }, filename: key, source: "local" }).sort({ updatedAt: -1, createdAt: -1 }).lean();
 	if (!file?.filepath) return null;
 	return {
 		id: key,

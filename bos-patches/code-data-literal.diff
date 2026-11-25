@@ -1,6 +1,6 @@
 --- a/packages/api/dist/index.cjs
 +++ b/packages/api/dist/index.cjs
-@@ -138151,6 +138151,75 @@
+@@ -138151,6 +138151,82 @@
  	}
  	return errorResult(tc, `${doc.name} (${doc.mime}, ${buffer.length} bytes) is neither an image nor text up to ${BOS_READ_FILE_TEXT_MAX} bytes; nothing was read. Process it in code (execute_code or bash_tool) with {{file:${key}}}.`);
  }
@@ -14,6 +14,9 @@
 +const BOS_CODE_LITERAL_KEYS_MIN = 20;
 +/** Dateiwerkzeuge der Sandbox: Daten in einer Datei abzulegen und sie im Code zu lesen, ist derselbe Umweg. */
 +const BOS_CODE_LITERAL_FILE_TOOLS = new Set(["create_file", "write_file", "edit_file"]);
++/** Eingaben fuer ein Skript eines Skills (Heredoc an /mnt/data/skills/<skill>/scripts/<name>.py) schreibt das Modell
++ *  selbst, etwa die Eintraege fuer fuellen.py; sie sind keine abgetippten Werkzeugergebnisse. */
++const BOS_CODE_LITERAL_SKILL_SCRIPT = /\/mnt\/data\/skills\/[^\s'"\/]+\/scripts\/[^\s'"\/]+\.py\b/;
 +const bosRefOriginals = new Map();
 +const bosLiteralRetries = new Map();
 +const bosQuotedRefOutputs = new Set();
@@ -62,6 +65,10 @@
 +	const literal = bosLongDataLiteral(written);
 +	if (literal == null) return null;
 +	const length = literal.length;
++	if (!BOS_CODE_LITERAL_FILE_TOOLS.has(tc.name) && BOS_CODE_LITERAL_SKILL_SCRIPT.test(written)) {
++		_librechat_data_schemas.logger.info(`[code-data-literal] ${tc.name}: ${length} characters for a skill script, run`);
++		return null;
++	}
 +	/** Dieselben Daten laufen beim zweiten Mal, auch wenn der Code darum herum anders ist. */
 +	const retryKey = `${user ?? ""}\n${require("crypto").createHash("sha256").update(literal).digest("hex")}`;
 +	if (bosLiteralRetries.delete(retryKey)) {
