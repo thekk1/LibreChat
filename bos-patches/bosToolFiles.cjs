@@ -21,6 +21,10 @@ const MAX_INLINE_TEXT = 100 * 1024;
 const APP_ROOT = "/app";
 const PUBLIC_ROOT = "/app/client/public";
 const FILE_REF = /\{\{file:([^{}\n]+?)\}\}/g;
+/** Vorlage statt Verweis, etwa {{file:<Name>}} in einem Auftrag: bleibt Text. */
+const isPlaceholder = (inner) => /<[^<>]*>/.test(inner);
+/** Pfad unter /mnt/data in der Antwort eines Subagenten. */
+const DATA_PATH = /\/mnt\/data\/([^\s`'"()\[\]{}<>|,;*]+)/g;
 const FILE_LINE = /\[FILE (F-[0-9a-f]{6}) \|[^\]\n]*\]/g;
 const FIELDS = ["name", "mime", "size", "file_id"];
 const BASE64_KEYS = ["content_base64", "data_base64", "base64"];
@@ -377,7 +381,7 @@ async function lookupAll(texts, scope) {
 	const found = new Map();
 	const unknown = [];
 	for (const text of texts) for (const ref of text.matchAll(FILE_REF)) {
-		if (found.has(ref[0]) || unknown.includes(ref[1])) continue;
+		if (found.has(ref[0]) || unknown.includes(ref[1]) || isPlaceholder(ref[1])) continue;
 		const { key, field } = parseRef(ref[1]);
 		if (field && !FIELDS.includes(field)) {
 			unknown.push(`${ref[1]} (fields: ${FIELDS.join(", ")})`);
@@ -436,6 +440,7 @@ async function expandArgs(args, scope, upload) {
 		let out = "";
 		let last = 0;
 		for (const ref of text.matchAll(FILE_REF)) {
+			if (!found.has(ref[0])) continue;
 			out += text.slice(last, ref.index) + await valueFor(found.get(ref[0]));
 			last = ref.index + ref[0].length;
 		}
@@ -465,10 +470,32 @@ async function describeRefs(text, scope) {
 	return { text: blocks.length === 0 ? text : `${text}\n\n${blocks.join("\n\n")}`, unknown };
 }
 
-/** Ende eines Subagenten: Zeilen [FILE ...] aus seinen Werkzeugergebnissen, die in seiner Antwort fehlen,
- *  haengt das Modul an; die Dateien gehoeren danach zum Aufruf des Hauptagenten (toolCallId). */
+/** Nennt ein Subagent eine Datei, die sein Code geschrieben hat, als Pfad /mnt/data/<Name>, wird daraus
+ *  {{file:<Name>}}: Der Pfad gilt nur in seiner Sandbox, der Verweis auch beim Hauptagenten. Nur Namen, die
+ *  eine Datei des Chats tragen. */
+async function namePaths(content, scope) {
+	if (!content.includes("/mnt/data/")) return content;
+	let out = "";
+	let last = 0;
+	for (const match of content.matchAll(DATA_PATH)) {
+		if (content.slice(Math.max(0, match.index - 7), match.index) === "{{file:") continue;
+		const name = match[1].replace(/[.:]+$/, "");
+		if (!name || !await resolveExact(name, scope)) continue;
+		out += content.slice(last, match.index) + `{{file:${name}}}`;
+		last = match.index + "/mnt/data/".length + name.length;
+	}
+	return out + content.slice(last);
+}
+
+/** Ende eines Subagenten: Pfade unter /mnt/data werden Verweise (namePaths); Zeilen [FILE ...] aus seinen
+ *  Werkzeugergebnissen, die in seiner Antwort fehlen, haengt das Modul an; die Dateien gehoeren danach zum
+ *  Aufruf des Hauptagenten (toolCallId). */
 async function collect({ content, messages, user, conversationId, parentToolCallId }) {
 	if (!user || !conversationId) return content;
+	content = await namePaths(content, { user, conversationIds: [conversationId] }).catch((error) => {
+		console.error("[bosToolFiles] namePaths failed", error);
+		return content;
+	});
 	const lines = new Map();
 	for (const message of messages) {
 		if (message._getType?.() !== "tool") continue;
@@ -517,6 +544,7 @@ async function renderAnswer(text, scope, attach) {
 	let last = 0;
 	for (const ref of text.matchAll(FILE_REF)) {
 		const entry = found.get(ref[0]);
+		if (!entry && isPlaceholder(ref[1])) continue;
 		let replacement = `[Datei ${parseRef(ref[1]).key} nicht verfuegbar]`;
 		if (entry) {
 			const { doc, field } = entry;
@@ -539,4 +567,4 @@ async function fileRecord(doc) {
 	return fileModel()?.findOne({ file_id: doc.file_id }).lean();
 }
 
-module.exports = { capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
+module.exports = { namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };

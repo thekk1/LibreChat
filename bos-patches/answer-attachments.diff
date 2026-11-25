@@ -1,32 +1,17 @@
---- a/api/app/clients/BaseClient.js
-+++ b/api/app/clients/BaseClient.js
-@@ -65,6 +65,25 @@
+diff -ruN a/api/app/clients/BaseClient.js b/api/app/clients/BaseClient.js
+--- a/api/app/clients/BaseClient.js	2026-11-25 14:45:24.546163163 +0100
++++ b/api/app/clients/BaseClient.js	2026-11-25 14:45:24.549163117 +0100
+@@ -65,6 +65,9 @@
  const { logViolation } = require('~/cache');
  const db = require('~/models');
  
-+/** BOS-Patch answer-attachments: Jeder Codelauf, der eine Datei neu schreibt, und jedes Bild, das read_file
-+ *  liest, wird ein Anhang der Antwort. Von Dateien gleichen Namens bleibt nur die letzte Fassung; Bilder aus
-+ *  read_file (Name <Datei-ID>-read_file_img_<ID>) entfallen, die gelesene Datei liegt schon im Chat. Die
-+ *  Eintraege in files bleiben, {{file:<Name>}} findet weiter die neueste. */
-+const bosShownAttachments = (attachments) => {
-+  const lastByName = new Map();
-+  attachments.forEach((attachment, index) => {
-+    if (typeof attachment.filename === 'string') {
-+      lastByName.set(attachment.filename, index);
-+    }
-+  });
-+  return attachments.filter((attachment, index) => {
-+    if (typeof attachment.filename !== 'string') {
-+      return true;
-+    }
-+    return !attachment.filename.includes('read_file_img_') && lastByName.get(attachment.filename) === index;
-+  });
-+};
++/** BOS-Patch answer-attachments, siehe bosShownAttachments.js. */
++const { bosShownAttachments } = require('./bosShownAttachments');
 +
  const omitUnreplayedHistoricalFiles = (messages) =>
    messages.map(({ files: _files, attachments: _attachments, ...message }) => ({
      ...message,
-@@ -1214,7 +1233,9 @@
+@@ -1214,7 +1217,9 @@
      }
  
      if (this.artifactPromises) {
@@ -37,3 +22,49 @@
      }
  
      if (this.options.attachments) {
+diff -ruN a/api/app/clients/bosShownAttachments.js b/api/app/clients/bosShownAttachments.js
+--- a/api/app/clients/bosShownAttachments.js	1970-01-01 01:00:00.000000000 +0100
++++ b/api/app/clients/bosShownAttachments.js	2026-11-25 14:45:24.554163039 +0100
+@@ -0,0 +1,21 @@
++/** BOS-Patch answer-attachments: Jeder Codelauf, der eine Datei neu schreibt, und jedes Bild, das read_file
++ *  liest, wird ein Anhang der Antwort. Von Dateien gleichen Namens bleibt nur die letzte Fassung; Bilder aus
++ *  read_file (Name <Datei-ID>-read_file_img_<ID>) entfallen, die gelesene Datei liegt schon im Chat. Die
++ *  Eintraege in files bleiben, {{file:<Name>}} findet weiter die neueste. Genutzt von BaseClient.js (Antwort
++ *  ohne Pause) und resume.js (Antwort nach einer Rueckfrage). */
++const bosShownAttachments = (attachments) => {
++  const lastByName = new Map();
++  attachments.forEach((attachment, index) => {
++    if (typeof attachment?.filename === 'string') {
++      lastByName.set(attachment.filename, index);
++    }
++  });
++  return attachments.filter((attachment, index) => {
++    if (typeof attachment?.filename !== 'string') {
++      return true;
++    }
++    return !attachment.filename.includes('read_file_img_') && lastByName.get(attachment.filename) === index;
++  });
++};
++
++module.exports = { bosShownAttachments };
+diff -ruN a/api/server/controllers/agents/resume.js b/api/server/controllers/agents/resume.js
+--- a/api/server/controllers/agents/resume.js	2026-11-25 14:45:24.550163101 +0100
++++ b/api/server/controllers/agents/resume.js	2026-11-25 14:45:24.553163054 +0100
+@@ -111,6 +111,7 @@
+   negotiateExistingGenerationProtocol,
+ } = require('./protocol');
+ const { promoteUnappliedSteers } = require('./promotion');
++const { bosShownAttachments } = require('~/app/clients/bosShownAttachments');
+ 
+ function sendGenerationJson(res, status, body, generationProtocolVersion) {
+   if (typeof res.set === 'function') {
+@@ -280,7 +281,8 @@
+       );
+     }
+   }
+-  return mergeAttachments(existing, resolved);
++  /** BOS-Patch answer-attachments: wie BaseClient.js, siehe bosShownAttachments.js. */
++  return bosShownAttachments(mergeAttachments(existing, resolved));
+ }
+ 
+ /**
