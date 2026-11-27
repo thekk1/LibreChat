@@ -1,6 +1,6 @@
 diff -ru a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs
---- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 17:20:29.978539242 +0100
-+++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 17:20:29.982458085 +0100
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 18:43:48.725301547 +0100
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 18:43:47.604077852 +0100
 @@ -487,6 +487,126 @@
  	return out + content.slice(last);
  }
@@ -135,16 +135,19 @@ diff -ru a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.c
 -module.exports = { namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
 +module.exports = { workspaceFiles, workspaceReadName, namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
 diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
---- a/packages/api/dist/index.cjs	2026-11-27 17:20:29.959615942 +0100
-+++ b/packages/api/dist/index.cjs	2026-11-27 17:29:59.122968862 +0100
-@@ -95166,6 +95166,45 @@
+--- a/packages/api/dist/index.cjs	2026-11-27 18:43:48.748308330 +0100
++++ b/packages/api/dist/index.cjs	2026-11-27 18:43:57.370830456 +0100
+@@ -95166,6 +95166,48 @@
  		sha256: (0, node_crypto.createHash)("sha256").update(buffer).digest("hex")
  	};
  }
++/** BOS-Patch shared-workspace: an mit BOS_SHARED_WORKSPACE=true (docker-compose.override.yml), sonst ganz aus. */
++const BOS_SHARED_WORKSPACE = process.env.BOS_SHARED_WORKSPACE === "true";
 +/** BOS-Patch shared-workspace: Liefert der Code eine Datei, die der Chat unter demselben Namen mit demselben Inhalt schon
 +*  hat (etwa eine Vorlage, die bei jedem Lauf neu ausgepackt wird), wird kein neuer Eintrag und keine neue Kopie auf der
 +*  Platte angelegt. Der vorhandene Eintrag bekommt den Verweis auf die neue Fassung in der Code-API und gilt als neueste. */
 +async function bosSameCodeOutput({ buffer, safeName, conversationId, userId, codeEnvRef }) {
++	if (!BOS_SHARED_WORKSPACE) return null;
 +	try {
 +		if (!conversationId || !userId) return null;
 +		const File = require("mongoose").models.File;
@@ -183,7 +186,7 @@ diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
  async function processCodeOutput({ req, id, name, toolCallId, conversationId, messageId, session_id, agentId, freshClaimAfter, codeApiBaseUrl, executionProfile = "default", executionRouteKey = executionProfile, bridgeWorkerId, preparedBuffer, downloadFallback, publication }, { getCodeOutputFileSettings, downloadCodeOutputBuffer, createDownloadFallback, getRetentionExpiry, convertImage, getStrategyFunctions, determineFileType, claimCodeFile, fileStorage, finalizePreview, hasOfficeHtmlPath, sanitizeArtifactPath, flattenArtifactPath, classifyCodeArtifact, extractCodeArtifactText, getExtractedTextFormat, getStorageMetadata, logAxiosError, logger }) {
  	const appConfig = req.config;
  	const currentDate = /* @__PURE__ */ new Date();
-@@ -95221,6 +95260,13 @@
+@@ -95221,6 +95263,13 @@
  		};
  		const safeName = sanitizeArtifactPath(name);
  		if (safeName !== name) logger.warn(`[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`);
@@ -197,7 +200,7 @@ diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
  		const sourceDispatchedAt = freshClaimAfter ?? currentDate.getTime();
  		const outputPersistence = createCodeOutputPersistence({
  			publication,
-@@ -138255,6 +138301,48 @@
+@@ -138255,6 +138304,49 @@
  	return errorResult(tc, `This call types ${length} characters of data into code or a file; nothing was run. Do not copy tool results into code or files. Put a reference where the data is: the {{toolNturnM}} key from the [ref: ...] line or _ref field of the result, exactly as shown there (in {{tool0turn2}} the first number is the position of the call in its step, the second the step), the data reference from a [DATA] line, or the file reference from a [FILE] line. If the data is not from a tool result, for example from the user's message, send the call again with the same data.`);
  }
  const BOS_SUBAGENT_IMAGE = /\.(png|jpe?g|gif|webp|bmp|tiff?)\b/i;
@@ -206,6 +209,7 @@ diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
 +*  Chat eine neuere Fassung hat; read_file liest sie dann aus dem Dateispeicher. Laeuft nach provisionFiles: Die Dateien,
 +*  die LibreChat selbst bereitstellt, stehen dann schon in der Sitzung. */
 +async function bosWorkspaceArgs(toolCalls, blocked, configurable, metadata) {
++	if (!BOS_SHARED_WORKSPACE) return;
 +	const user = resolveBackgroundUserId(configurable);
 +	if (!user) return;
 +	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
@@ -246,7 +250,7 @@ diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
  async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
  	const bosStep = metadata?.langgraph_step;
  	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
-@@ -138503,6 +138591,7 @@
+@@ -138503,6 +138595,7 @@
  						const merged = mergeCodeFilesIntoContext(tc.codeSessionContext, provisionedCodeFiles);
  						if (merged) tc.codeSessionContext = merged;
  					}
