@@ -487,6 +487,126 @@ async function namePaths(content, scope) {
 	return out + content.slice(last);
 }
 
+/** Gemeinsamer Arbeitsordner: Jede Datei des Chats liegt fuer jeden Agenten unter /mnt/data/<Name>, je Name die
+ *  neueste Fassung (Werkzeugdatei oder Datei in `files`). Nennt ein Codeaufruf so einen Pfad und fehlt die Datei in
+ *  seiner Code-Sitzung oder hat der Chat seither eine neuere Fassung, wird sie vor dem Lauf hochgeladen. Ohne
+ *  Verzeichnis im Namen; Dateien der Sandbox, die (noch) nicht zum Chat gehoeren, bleiben unberuehrt. */
+const WORKSPACE_PREFIX = "/mnt/data/";
+const WORKSPACE_NAME_CHAR = /[\w.\-À-ɏ]/;
+/** Hochgeladene Fassungen: Datei-ID in der Code-API -> file_id der Datei des Chats (je Prozess, die neuesten 2000). */
+const workspaceUploads = new Map();
+function rememberUpload(codeFileId, fileId) {
+	workspaceUploads.set(codeFileId, fileId);
+	if (workspaceUploads.size > 2000) workspaceUploads.delete(workspaceUploads.keys().next().value);
+}
+/** Namen des Chats, die als /mnt/data/<Name> mit Wortgrenze im Text stehen, laengste zuerst. */
+function namedPaths(texts, names) {
+	const hits = new Set();
+	for (const name of [...names].sort((a, b) => b.length - a.length)) {
+		const needle = WORKSPACE_PREFIX + name;
+		for (const text of texts) {
+			let at = text.indexOf(needle);
+			while (at >= 0) {
+				const next = text.charAt(at + needle.length);
+				if (next === "" || !WORKSPACE_NAME_CHAR.test(next)) {
+					hits.add(name);
+					break;
+				}
+				at = text.indexOf(needle, at + 1);
+			}
+			if (hits.has(name)) break;
+		}
+	}
+	return [...hits];
+}
+/** Dateien des Chats ohne Verzeichnis im Namen: neueste Fassung je Name (latest) und der Zeitpunkt jeder Fassung,
+ *  nach file_id und nach Datei-ID in der Code-API (Ergebnisse der Codeausfuehrung). */
+async function chatFiles({ user, conversationIds }) {
+	const ids = scopeIds(conversationIds);
+	const latest = new Map();
+	const timeByFileId = new Map();
+	const timeByCodeId = new Map();
+	if (!user || ids.length === 0) return { latest, timeByFileId, timeByCodeId };
+	const put = (entry) => {
+		if (!entry.name || entry.name.includes("/")) return;
+		timeByFileId.set(entry.doc.file_id, entry.time);
+		if (entry.codeFileId) timeByCodeId.set(entry.codeFileId, entry.time);
+		const known = latest.get(entry.name);
+		if (!known || entry.time > known.time) latest.set(entry.name, entry);
+	};
+	const col = collection();
+	await indexReady;
+	for (const doc of await col.find({ user: String(user), conversationId: { $in: ids } }).toArray()) put({ name: doc.name, time: new Date(doc.createdAt ?? 0).getTime(), codeFileId: null, doc });
+	const File = fileModel();
+	if (File) for (const file of await File.find({ user: String(user), conversationId: { $in: ids }, source: "local", filepath: { $exists: true } }, { filename: 1, file_id: 1, filepath: 1, bytes: 1, type: 1, conversationId: 1, updatedAt: 1, createdAt: 1, "metadata.codeEnvSource.file_id": 1 }).lean()) put({
+		name: file.filename,
+		time: new Date(file.updatedAt ?? file.createdAt ?? 0).getTime(),
+		codeFileId: file.metadata?.codeEnvSource?.file_id ?? null,
+		doc: {
+			id: file.filename,
+			user: String(user),
+			conversationId: file.conversationId,
+			file_id: file.file_id,
+			name: file.filename,
+			mime: mimeOf(file.filename, file.type),
+			size: file.bytes,
+			source: "chat",
+			filepath: file.filepath,
+			diskPath: diskPath(file.filepath)
+		}
+	});
+	return { latest, timeByFileId, timeByCodeId };
+}
+/** Braucht die Sitzung die neueste Fassung? Fehlt der Name: ja. Hat sie eine Fassung, die der Chat kennt (Ergebnis
+ *  oder Hochladen), und ist die neueste Fassung juenger: ja. Eine Fassung, die der Chat nicht kennt, hat die Sandbox
+ *  selbst geschrieben, sie bleibt. */
+function needsLatest(name, entry, files, chat) {
+	const mine = (files ?? []).filter((file) => file?.name === name);
+	if (mine.length === 0) return true;
+	let known = false;
+	for (const file of mine) {
+		if (file.id === entry.codeFileId || workspaceUploads.get(file.id) === entry.doc.file_id) return false;
+		const uploadedFrom = workspaceUploads.get(file.id);
+		const time = chat.timeByCodeId.get(file.id) ?? (uploadedFrom == null ? void 0 : chat.timeByFileId.get(uploadedFrom));
+		if (time == null) return false;
+		if (time < entry.time) known = true;
+	}
+	return known;
+}
+/** Dateien des Chats, die ein Codeaufruf als Pfad nennt und deren neueste Fassung seiner Sitzung fehlt: hochladen
+ *  und als codeFiles zurueckgeben. context = Code-Sitzung des Aufrufs. */
+async function workspaceFiles(args, scope, context, upload) {
+	const texts = stringsOf(args).filter((text) => text.includes(WORKSPACE_PREFIX));
+	if (texts.length === 0) return { args, codeFiles: [] };
+	const chat = await chatFiles(scope);
+	const codeFiles = [];
+	const renames = new Map();
+	for (const name of namedPaths(texts, chat.latest.keys())) {
+		const entry = chat.latest.get(name);
+		if (!needsLatest(name, entry, context?.files, chat)) continue;
+		const codeFile = await upload(entry.doc);
+		rememberUpload(codeFile.id, entry.doc.file_id);
+		codeFiles.push(codeFile);
+		if (codeFile.name !== name) renames.set(WORKSPACE_PREFIX + name, WORKSPACE_PREFIX + codeFile.name);
+	}
+	if (renames.size > 0) args = await mapStrings(args, (text) => {
+		let out = text;
+		for (const [from, to] of renames) out = out.split(from).join(to);
+		return out;
+	});
+	return { args, codeFiles };
+}
+/** read_file mit /mnt/data/<Name>: Name der Datei des Chats, wenn die Sitzung ihre neueste Fassung nicht hat. */
+async function workspaceReadName(pathText, scope, context) {
+	const text = String(pathText ?? "").trim();
+	if (!text.startsWith(WORKSPACE_PREFIX)) return null;
+	const name = text.slice(WORKSPACE_PREFIX.length);
+	if (!name || name.includes("/")) return null;
+	const chat = await chatFiles(scope);
+	const entry = chat.latest.get(name);
+	return entry && needsLatest(name, entry, context?.files, chat) ? name : null;
+}
+
 /** Ende eines Subagenten: Pfade unter /mnt/data werden Verweise (namePaths); Zeilen [FILE ...] aus seinen
  *  Werkzeugergebnissen, die in seiner Antwort fehlen, haengt das Modul an; die Dateien gehoeren danach zum
  *  Aufruf des Hauptagenten (toolCallId). */
@@ -567,4 +687,4 @@ async function fileRecord(doc) {
 	return fileModel()?.findOne({ file_id: doc.file_id }).lean();
 }
 
-module.exports = { namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
+module.exports = { workspaceFiles, workspaceReadName, namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };

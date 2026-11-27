@@ -1,0 +1,256 @@
+diff -ru a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs
+--- a/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 17:20:29.978539242 +0100
++++ b/node_modules/@librechat/agents/dist/cjs/tools/subagent/bosToolFiles.cjs	2026-11-27 17:20:29.982458085 +0100
+@@ -487,6 +487,126 @@
+ 	return out + content.slice(last);
+ }
+ 
++/** Gemeinsamer Arbeitsordner: Jede Datei des Chats liegt fuer jeden Agenten unter /mnt/data/<Name>, je Name die
++ *  neueste Fassung (Werkzeugdatei oder Datei in `files`). Nennt ein Codeaufruf so einen Pfad und fehlt die Datei in
++ *  seiner Code-Sitzung oder hat der Chat seither eine neuere Fassung, wird sie vor dem Lauf hochgeladen. Ohne
++ *  Verzeichnis im Namen; Dateien der Sandbox, die (noch) nicht zum Chat gehoeren, bleiben unberuehrt. */
++const WORKSPACE_PREFIX = "/mnt/data/";
++const WORKSPACE_NAME_CHAR = /[\w.\-À-ɏ]/;
++/** Hochgeladene Fassungen: Datei-ID in der Code-API -> file_id der Datei des Chats (je Prozess, die neuesten 2000). */
++const workspaceUploads = new Map();
++function rememberUpload(codeFileId, fileId) {
++	workspaceUploads.set(codeFileId, fileId);
++	if (workspaceUploads.size > 2000) workspaceUploads.delete(workspaceUploads.keys().next().value);
++}
++/** Namen des Chats, die als /mnt/data/<Name> mit Wortgrenze im Text stehen, laengste zuerst. */
++function namedPaths(texts, names) {
++	const hits = new Set();
++	for (const name of [...names].sort((a, b) => b.length - a.length)) {
++		const needle = WORKSPACE_PREFIX + name;
++		for (const text of texts) {
++			let at = text.indexOf(needle);
++			while (at >= 0) {
++				const next = text.charAt(at + needle.length);
++				if (next === "" || !WORKSPACE_NAME_CHAR.test(next)) {
++					hits.add(name);
++					break;
++				}
++				at = text.indexOf(needle, at + 1);
++			}
++			if (hits.has(name)) break;
++		}
++	}
++	return [...hits];
++}
++/** Dateien des Chats ohne Verzeichnis im Namen: neueste Fassung je Name (latest) und der Zeitpunkt jeder Fassung,
++ *  nach file_id und nach Datei-ID in der Code-API (Ergebnisse der Codeausfuehrung). */
++async function chatFiles({ user, conversationIds }) {
++	const ids = scopeIds(conversationIds);
++	const latest = new Map();
++	const timeByFileId = new Map();
++	const timeByCodeId = new Map();
++	if (!user || ids.length === 0) return { latest, timeByFileId, timeByCodeId };
++	const put = (entry) => {
++		if (!entry.name || entry.name.includes("/")) return;
++		timeByFileId.set(entry.doc.file_id, entry.time);
++		if (entry.codeFileId) timeByCodeId.set(entry.codeFileId, entry.time);
++		const known = latest.get(entry.name);
++		if (!known || entry.time > known.time) latest.set(entry.name, entry);
++	};
++	const col = collection();
++	await indexReady;
++	for (const doc of await col.find({ user: String(user), conversationId: { $in: ids } }).toArray()) put({ name: doc.name, time: new Date(doc.createdAt ?? 0).getTime(), codeFileId: null, doc });
++	const File = fileModel();
++	if (File) for (const file of await File.find({ user: String(user), conversationId: { $in: ids }, source: "local", filepath: { $exists: true } }, { filename: 1, file_id: 1, filepath: 1, bytes: 1, type: 1, conversationId: 1, updatedAt: 1, createdAt: 1, "metadata.codeEnvSource.file_id": 1 }).lean()) put({
++		name: file.filename,
++		time: new Date(file.updatedAt ?? file.createdAt ?? 0).getTime(),
++		codeFileId: file.metadata?.codeEnvSource?.file_id ?? null,
++		doc: {
++			id: file.filename,
++			user: String(user),
++			conversationId: file.conversationId,
++			file_id: file.file_id,
++			name: file.filename,
++			mime: mimeOf(file.filename, file.type),
++			size: file.bytes,
++			source: "chat",
++			filepath: file.filepath,
++			diskPath: diskPath(file.filepath)
++		}
++	});
++	return { latest, timeByFileId, timeByCodeId };
++}
++/** Braucht die Sitzung die neueste Fassung? Fehlt der Name: ja. Hat sie eine Fassung, die der Chat kennt (Ergebnis
++ *  oder Hochladen), und ist die neueste Fassung juenger: ja. Eine Fassung, die der Chat nicht kennt, hat die Sandbox
++ *  selbst geschrieben, sie bleibt. */
++function needsLatest(name, entry, files, chat) {
++	const mine = (files ?? []).filter((file) => file?.name === name);
++	if (mine.length === 0) return true;
++	let known = false;
++	for (const file of mine) {
++		if (file.id === entry.codeFileId || workspaceUploads.get(file.id) === entry.doc.file_id) return false;
++		const uploadedFrom = workspaceUploads.get(file.id);
++		const time = chat.timeByCodeId.get(file.id) ?? (uploadedFrom == null ? void 0 : chat.timeByFileId.get(uploadedFrom));
++		if (time == null) return false;
++		if (time < entry.time) known = true;
++	}
++	return known;
++}
++/** Dateien des Chats, die ein Codeaufruf als Pfad nennt und deren neueste Fassung seiner Sitzung fehlt: hochladen
++ *  und als codeFiles zurueckgeben. context = Code-Sitzung des Aufrufs. */
++async function workspaceFiles(args, scope, context, upload) {
++	const texts = stringsOf(args).filter((text) => text.includes(WORKSPACE_PREFIX));
++	if (texts.length === 0) return { args, codeFiles: [] };
++	const chat = await chatFiles(scope);
++	const codeFiles = [];
++	const renames = new Map();
++	for (const name of namedPaths(texts, chat.latest.keys())) {
++		const entry = chat.latest.get(name);
++		if (!needsLatest(name, entry, context?.files, chat)) continue;
++		const codeFile = await upload(entry.doc);
++		rememberUpload(codeFile.id, entry.doc.file_id);
++		codeFiles.push(codeFile);
++		if (codeFile.name !== name) renames.set(WORKSPACE_PREFIX + name, WORKSPACE_PREFIX + codeFile.name);
++	}
++	if (renames.size > 0) args = await mapStrings(args, (text) => {
++		let out = text;
++		for (const [from, to] of renames) out = out.split(from).join(to);
++		return out;
++	});
++	return { args, codeFiles };
++}
++/** read_file mit /mnt/data/<Name>: Name der Datei des Chats, wenn die Sitzung ihre neueste Fassung nicht hat. */
++async function workspaceReadName(pathText, scope, context) {
++	const text = String(pathText ?? "").trim();
++	if (!text.startsWith(WORKSPACE_PREFIX)) return null;
++	const name = text.slice(WORKSPACE_PREFIX.length);
++	if (!name || name.includes("/")) return null;
++	const chat = await chatFiles(scope);
++	const entry = chat.latest.get(name);
++	return entry && needsLatest(name, entry, context?.files, chat) ? name : null;
++}
++
+ /** Ende eines Subagenten: Pfade unter /mnt/data werden Verweise (namePaths); Zeilen [FILE ...] aus seinen
+  *  Werkzeugergebnissen, die in seiner Antwort fehlen, haengt das Modul an; die Dateien gehoeren danach zum
+  *  Aufruf des Hauptagenten (toolCallId). */
+@@ -567,4 +687,4 @@
+ 	return fileModel()?.findOne({ file_id: doc.file_id }).lean();
+ }
+ 
+-module.exports = { namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
++module.exports = { workspaceFiles, workspaceReadName, namePaths, capture, expandArgs, describeRefs, collect, renderAnswer, fileRecord, resolve, handleLine, store, FILE_REF };
+diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
+--- a/packages/api/dist/index.cjs	2026-11-27 17:20:29.959615942 +0100
++++ b/packages/api/dist/index.cjs	2026-11-27 17:29:59.122968862 +0100
+@@ -95166,6 +95166,45 @@
+ 		sha256: (0, node_crypto.createHash)("sha256").update(buffer).digest("hex")
+ 	};
+ }
++/** BOS-Patch shared-workspace: Liefert der Code eine Datei, die der Chat unter demselben Namen mit demselben Inhalt schon
++*  hat (etwa eine Vorlage, die bei jedem Lauf neu ausgepackt wird), wird kein neuer Eintrag und keine neue Kopie auf der
++*  Platte angelegt. Der vorhandene Eintrag bekommt den Verweis auf die neue Fassung in der Code-API und gilt als neueste. */
++async function bosSameCodeOutput({ buffer, safeName, conversationId, userId, codeEnvRef }) {
++	try {
++		if (!conversationId || !userId) return null;
++		const File = require("mongoose").models.File;
++		if (!File) return null;
++		const sha256 = (0, node_crypto.createHash)("sha256").update(buffer).digest("hex");
++		const existing = await File.findOne({
++			conversationId,
++			user: userId,
++			filename: safeName,
++			source: "local",
++			bytes: buffer.length,
++			"metadata.codeOutput.sha256": sha256
++		}).sort({ updatedAt: -1 }).lean();
++		if (!existing?.filepath) return null;
++		const onDisk = existing.filepath.startsWith("/images/") ? path.default.join("/app/client/public", existing.filepath) : path.default.join("/app", existing.filepath);
++		if (!require("fs").existsSync(onDisk)) return null;
++		const updatedAt = /* @__PURE__ */ new Date();
++		await File.updateOne({ _id: existing._id }, { $set: {
++			updatedAt,
++			"metadata.codeEnvSource": codeEnvRef
++		} }, { timestamps: false });
++		_librechat_data_schemas.logger.info(`[shared-workspace] code output ${safeName}: same content as file ${existing.file_id}, no new file`);
++		return {
++			...existing,
++			updatedAt,
++			metadata: {
++				...existing.metadata,
++				codeEnvSource: codeEnvRef
++			}
++		};
++	} catch (error) {
++		_librechat_data_schemas.logger.error("[shared-workspace] code output", error);
++		return null;
++	}
++}
+ async function processCodeOutput({ req, id, name, toolCallId, conversationId, messageId, session_id, agentId, freshClaimAfter, codeApiBaseUrl, executionProfile = "default", executionRouteKey = executionProfile, bridgeWorkerId, preparedBuffer, downloadFallback, publication }, { getCodeOutputFileSettings, downloadCodeOutputBuffer, createDownloadFallback, getRetentionExpiry, convertImage, getStrategyFunctions, determineFileType, claimCodeFile, fileStorage, finalizePreview, hasOfficeHtmlPath, sanitizeArtifactPath, flattenArtifactPath, classifyCodeArtifact, extractCodeArtifactText, getExtractedTextFormat, getStorageMetadata, logAxiosError, logger }) {
+ 	const appConfig = req.config;
+ 	const currentDate = /* @__PURE__ */ new Date();
+@@ -95221,6 +95260,13 @@
+ 		};
+ 		const safeName = sanitizeArtifactPath(name);
+ 		if (safeName !== name) logger.warn(`[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`);
++		/** BOS-Patch shared-workspace: gleicher Name und gleicher Inhalt wie eine Datei des Chats ergibt keinen neuen Eintrag. */
++		const bosSame = await bosSameCodeOutput({ buffer, safeName, conversationId, userId: req.user.id, codeEnvRef });
++		if (bosSame != null) return { file: Object.assign(bosSame, {
++			messageId,
++			toolCallId,
++			agentId
++		}) };
+ 		const sourceDispatchedAt = freshClaimAfter ?? currentDate.getTime();
+ 		const outputPersistence = createCodeOutputPersistence({
+ 			publication,
+@@ -138255,6 +138301,48 @@
+ 	return errorResult(tc, `This call types ${length} characters of data into code or a file; nothing was run. Do not copy tool results into code or files. Put a reference where the data is: the {{toolNturnM}} key from the [ref: ...] line or _ref field of the result, exactly as shown there (in {{tool0turn2}} the first number is the position of the call in its step, the second the step), the data reference from a [DATA] line, or the file reference from a [FILE] line. If the data is not from a tool result, for example from the user's message, send the call again with the same data.`);
+ }
+ const BOS_SUBAGENT_IMAGE = /\.(png|jpe?g|gif|webp|bmp|tiff?)\b/i;
++/** BOS-Patch shared-workspace: Jede Datei des Chats liegt fuer jeden Agenten unter /mnt/data/<Name>. Nennt ein
++*  Codeaufruf so einen Pfad, laedt bosToolFiles.workspaceFiles die Datei vorher hoch, wenn sie der Sitzung fehlt oder der
++*  Chat eine neuere Fassung hat; read_file liest sie dann aus dem Dateispeicher. Laeuft nach provisionFiles: Die Dateien,
++*  die LibreChat selbst bereitstellt, stehen dann schon in der Sitzung. */
++async function bosWorkspaceArgs(toolCalls, blocked, configurable, metadata) {
++	const user = resolveBackgroundUserId(configurable);
++	if (!user) return;
++	const conversationIds = [metadata?.thread_id, configurable?.thread_id, configurable?.req?.body?.conversationId];
++	for (const tc of toolCalls) {
++		if (blocked.has(tc) || tc.name === "subagent") continue;
++		const text = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args ?? {});
++		if (!text.includes("/mnt/data/")) continue;
++		try {
++			const scope = { user, conversationIds };
++			if (tc.name === "read_file") {
++				let readArgs = tc.args ?? {};
++				if (typeof readArgs === "string") try {
++					readArgs = JSON.parse(readArgs);
++				} catch {
++					readArgs = {};
++				}
++				const name = await bosToolFiles.workspaceReadName(readArgs.path, scope, tc.codeSessionContext);
++				if (name != null) blocked.set(tc, await bosReadFileRef({ ...tc, args: { ...readArgs, path: `{{file:${name}}}` } }, scope, configurable?.req));
++			} else if (isCodeSessionAwareToolCall(tc.name, configurable ?? {})) {
++				const { args, codeFiles } = await bosToolFiles.workspaceFiles(tc.args, scope, tc.codeSessionContext, bosCodeUploader(configurable, user));
++				tc.args = args;
++				if (codeFiles.length > 0) {
++					_librechat_data_schemas.logger.info(`[shared-workspace] ${tc.name}: ${codeFiles.map((file) => file.name).join(", ")} uploaded`);
++					const names = new Set(codeFiles.map((file) => file.name));
++					const prior = tc.codeSessionContext == null ? void 0 : {
++						...tc.codeSessionContext,
++						files: (tc.codeSessionContext.files ?? []).filter((file) => !names.has(file.name))
++					};
++					const merged = mergeCodeFilesIntoContext(prior, codeFiles);
++					if (merged) tc.codeSessionContext = merged;
++				}
++			}
++		} catch (error) {
++			_librechat_data_schemas.logger.error("[shared-workspace] tool arguments", error);
++		}
++	}
++}
+ async function bosPrepareToolArgs(toolCalls, blocked, configurable, metadata) {
+ 	const bosStep = metadata?.langgraph_step;
+ 	if (BOS_SUBAGENT_STEP_GUARD > 0 && (metadata?.executionContext?.depth ?? 0) > 0 && typeof bosStep === "number") {
+@@ -138503,6 +138591,7 @@
+ 						const merged = mergeCodeFilesIntoContext(tc.codeSessionContext, provisionedCodeFiles);
+ 						if (merged) tc.codeSessionContext = merged;
+ 					}
++					await bosWorkspaceArgs(allowedToolCalls, preloadedNameBlocks, sourceConfigurable, metadata);
+ 					const waitsForSkillFiles = (tc) => tc.name !== _librechat_agents.Constants.SKILL_TOOL && (isCodeSessionAwareToolCall(tc.name, mergedConfigurable) || runFileSharingActive && isCodeFileToolName(tc.name));
+ 					const skillToolCallIds = new Set(allowedToolCalls.filter((tc) => tc.name === _librechat_agents.Constants.SKILL_TOOL).map((tc) => tc.id));
+ 					if (skillToolCallIds.size > 0 && allowedToolCalls.some(waitsForSkillFiles)) skillFilesHandoff = createSkillFilesHandoff(skillToolCallIds, runSignal);
