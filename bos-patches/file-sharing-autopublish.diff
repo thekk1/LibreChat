@@ -1,0 +1,80 @@
+diff -ru a/packages/api/dist/index.cjs b/packages/api/dist/index.cjs
+--- a/packages/api/dist/index.cjs	2026-11-27 22:25:55.875598129 +0100
++++ b/packages/api/dist/index.cjs	2026-11-27 22:25:55.890597842 +0100
+@@ -95264,7 +95264,7 @@
+ 		const safeName = sanitizeArtifactPath(name);
+ 		if (safeName !== name) logger.warn(`[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`);
+ 		/** BOS-Patch shared-workspace: gleicher Name und gleicher Inhalt wie eine Datei des Chats ergibt keinen neuen Eintrag. */
+-		const bosSame = await bosSameCodeOutput({ buffer, safeName, conversationId, userId: req.user.id, codeEnvRef });
++		const bosSame = publication != null ? null : await bosSameCodeOutput({ buffer, safeName, conversationId, userId: req.user.id, codeEnvRef });
+ 		if (bosSame != null) return { file: Object.assign(bosSame, {
+ 			messageId,
+ 			toolCallId,
+@@ -163799,6 +163799,25 @@
+ 	}) ? files : void 0;
+ }
+ /** Coordinates the SDK's execution identities with file grants and host-owned tool contexts. */
++/** BOS-Patch file-sharing-autopublish: Mit fileSharing (endpoints.agents.fileSharing, subagents.shareFiles) bleibt,
++*  was ein Subagent im Code schreibt, privat, bis er publish_artifact aufruft. Mit BOS_FILE_SHARING_AUTOPUBLISH=true wird
++*  jede neue Fassung gleich veroeffentlicht und so eine Datei des Chats fuer alle Agenten, ausser die neueste Datei des
++*  Chats unter diesem Namen hat schon denselben Inhalt (SHA-256). */
++const BOS_FILE_SHARING_AUTOPUBLISH = process.env.BOS_FILE_SHARING_AUTOPUBLISH === "true";
++async function bosRunOutputKnown(scope, value) {
++	try {
++		const File = require("mongoose").models.File;
++		if (!File || !scope?.conversationId || !scope?.userId) return false;
++		const latest = await File.findOne({
++			conversationId: scope.conversationId,
++			user: scope.userId,
++			filename: value.filename
++		}, { metadata: 1 }).sort({ updatedAt: -1 }).lean();
++		return latest?.metadata?.codeOutput?.sha256 != null && latest.metadata.codeOutput.sha256 === value.sha256;
++	} catch {
++		return false;
++	}
++}
+ function createRunFileSession(deps) {
+ 	let manifest;
+ 	let scope;
+@@ -163966,7 +163985,7 @@
+ 		if (!input.resumed && preparations.length > 0) {
+ 			const { actor: { agentId }, files } = preparations[0];
+ 			const catalog = describeRunFiles(files, scope.runId);
+-			messages = [new _librechat_agents_langchain.HumanMessage({ content: `Files shared for this task (read-only inputs):\n${JSON.stringify(catalog)}\nUse list_run_files to discover later publications. Generated outputs remain private until publish_artifact succeeds.` }), ...await deps.encodeMessages(files, agentId)];
++			messages = [new _librechat_agents_langchain.HumanMessage({ content: `Files shared for this task (read-only inputs):\n${JSON.stringify(catalog)}\nUse list_run_files to discover later publications. ${BOS_FILE_SHARING_AUTOPUBLISH ? "Files you write under /mnt/data become files of the chat after each code call; publish_artifact is not needed." : "Generated outputs remain private until publish_artifact succeeds."}` }), ...await deps.encodeMessages(files, agentId)];
+ 		}
+ 		return {
+ 			messages,
+@@ -163993,6 +164012,7 @@
+ 		const captureSignal = operationSignal ? AbortSignal.any([lifetime.signal, operationSignal]) : lifetime.signal;
+ 		const outputs = staged.get(key) ?? /* @__PURE__ */ new Map();
+ 		staged.set(key, outputs);
++		const bosNew = [];
+ 		for (const file of incomingFiles) {
+ 			const sessionId = file.storage_session_id ?? file.session_id ?? artifact.session_id;
+ 			if (!sessionId) throw new Error("The generated artifact has no sandbox identity.");
+@@ -164020,11 +164040,24 @@
+ 				};
+ 				manifest.stage(actor, value);
+ 				outputs.set(value.id, value);
++				bosNew.push(value);
+ 				retained = true;
+ 			} finally {
+ 				if (!retained) await deps.snapshots.discard(snapshot.snapshotId);
+ 			}
+ 		}
++		if (BOS_FILE_SHARING_AUTOPUBLISH) for (const value of bosNew) try {
++			if (await bosRunOutputKnown(scope, value)) {
++				outputs.delete(value.id);
++				await deps.snapshots.discard(value.source.snapshotId).catch(() => void 0);
++				_librechat_data_schemas.logger.info(`[file-sharing-autopublish] ${value.filename}: same content as the chat file, not published`);
++				continue;
++			}
++			const published = await publish(agentId, context, value.id, [], captureSignal);
++			_librechat_data_schemas.logger.info(`[file-sharing-autopublish] ${value.filename}: published as ${published.file_id}`);
++		} catch (error) {
++			_librechat_data_schemas.logger.warn(`[file-sharing-autopublish] ${value.filename}: ${error?.message ?? error}`);
++		}
+ 		return true;
+ 	}
+ 	function withCodeExecution(agentId, context, signal, execute) {
