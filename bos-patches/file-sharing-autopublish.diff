@@ -1,6 +1,6 @@
---- a/packages/api/dist/index.cjs	2026-11-28 11:11:21.050342299 +0100
-+++ b/packages/api/dist/index.cjs	2026-11-28 11:11:21.067341687 +0100
-@@ -95267,7 +95267,7 @@
+--- a/packages/api/dist/index.cjs	2026-11-28 11:55:34.439816328 +0100
++++ b/packages/api/dist/index.cjs	2026-11-28 11:55:34.419816161 +0100
+@@ -95264,7 +95264,7 @@
  		const safeName = sanitizeArtifactPath(name);
  		if (safeName !== name) logger.warn(`[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`);
  		/** BOS-Patch shared-workspace: gleicher Name und gleicher Inhalt wie eine Datei des Chats ergibt keinen neuen Eintrag. */
@@ -9,7 +9,7 @@
  		if (bosSame != null) return { file: Object.assign(bosSame, {
  			messageId,
  			toolCallId,
-@@ -163802,6 +163802,26 @@
+@@ -163799,6 +163799,26 @@
  	}) ? files : void 0;
  }
  /** Coordinates the SDK's execution identities with file grants and host-owned tool contexts. */
@@ -36,7 +36,7 @@
  function createRunFileSession(deps) {
  	let manifest;
  	let scope;
-@@ -163969,7 +163989,7 @@
+@@ -163966,7 +163986,7 @@
  		if (!input.resumed && preparations.length > 0) {
  			const { actor: { agentId }, files } = preparations[0];
  			const catalog = describeRunFiles(files, scope.runId);
@@ -45,7 +45,7 @@
  		}
  		return {
  			messages,
-@@ -164078,8 +164098,44 @@
+@@ -164075,8 +164095,44 @@
  		});
  		return file;
  	}
